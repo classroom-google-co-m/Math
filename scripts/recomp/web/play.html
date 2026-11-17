@@ -148,7 +148,7 @@
       <h3 id="error-title">Something went wrong</h3>
       <div id="error-text" class="note"></div>
       <pre id="errlog"></pre>
-      <div class="row"><button id="reload-btn" type="button">Reload</button><button id="copylog-btn" type="button">Copy log</button><button id="dismiss-btn" type="button">Dismiss</button></div>
+      <div class="row"><button id="reload-btn" type="button">Reload</button><button id="nomods-btn" type="button" hidden>Reload without mods</button><button id="copylog-btn" type="button">Copy log</button><button id="dismiss-btn" type="button">Dismiss</button></div>
     </div>
     <pre id="log">booting...</pre>
   </div>
@@ -163,7 +163,10 @@
     <button id="export-zip" type="button">Export .zip</button>
     <button id="export-json" type="button">Export .json</button>
     <button id="import-btn" type="button">Import&hellip;</button>
-    <input id="import-file" type="file" accept=".zip,.json,application/zip,application/json" hidden>
+    <!-- No accept list: EDIT FILE's import takes a bare persistentgamedata .dat too, and an
+         iPhone's picker greys out every file an accept list does not name (.dat has no type
+         it knows, so naming it would not help). What was chosen is told apart by its bytes. -->
+    <input id="import-file" type="file" hidden>
     <button id="reset-saves" type="button">Reset</button>
   </div>
   <div id="saves-status" class="note"></div>

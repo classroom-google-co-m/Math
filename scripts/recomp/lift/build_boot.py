@@ -125,6 +125,18 @@ LIFT_CFLAGS = ["-O2", "-w", "-DRECOMP_MEM_CHECK=1"]
 
 LDFLAGS = [
     "-O2", "-w", "--no-entry", "--profiling-funcs",
+    # Round 119: Binaryen inlines a function that has one caller whatever its
+    # size (--one-caller-inline-max-function-size is unlimited by default), and
+    # so put the parts split_giants.py cuts the giant functions into back into
+    # their trampolines at the link: the wasm had one 1.83 MB function for
+    # sub_005d4380 again (round 43 noted it and measured only memory). V8
+    # compiles a function whole the first time it is called, on the main
+    # thread: 440 ms for that one at the first effect of a run, 77 ms for the
+    # next largest (the trace of perf-rooms.mjs: wasm.CompileLazy). With this
+    # limit, in Binaryen's own size measure (expression nodes), a part stays a
+    # function of its own, is compiled when it is first reached, and is
+    # optimised on its own.
+    "-sBINARYEN_EXTRA_PASSES=--one-caller-inline-max-function-size=4000",
     # The wasm memory is committed the moment it is created, so INITIAL_MEMORY is
     # resident bytes on every machine that opens the page; growing it later
     # reallocates and copies the whole heap (round 15e: a 200-s play run managed
@@ -340,8 +352,11 @@ def main():
         patched |= set(apply_split_giants(lift_dir))
         # Round 96: the EIP/FS_OFFSET spill and reload lines go last, after the
         # passes whose old text may contain them (lift_patches.apply_call_slim).
-        from lift_patches import apply_call_slim  # noqa: E402
+        from lift_patches import apply_call_slim, apply_ret_eip  # noqa: E402
         patched |= set(apply_call_slim(lift_dir))
+        # Round 101: and the one EIP store the host does read goes back, on the
+        # ret's own line (the replay after a guest longjmp or a C++ catch).
+        patched |= set(apply_ret_eip(lift_dir))
         print("lift-patches: %d TU(s) rewritten" % len(patched))
 
     BOOT_OUT.mkdir(parents=True, exist_ok=True)
@@ -523,7 +538,8 @@ def main():
     if args.fast_link:
         # -O2 at link runs wasm-opt over the whole 272 MB module and dominates
         # the 8-minute link; the objects are already -O2. Measured per build.
-        ldflags = ["-O0" if f == "-O2" else f for f in ldflags]
+        # (and no wasm-opt at all, so nothing for its inliner's limit either)
+        ldflags = ["-O0" if f == "-O2" else f for f in ldflags if not f.startswith("-sBINARYEN_EXTRA_PASSES=")]
     result["fastLink"] = bool(args.fast_link)
     lines.extend(ldflags)
     lines += ["-sEXPORTED_FUNCTIONS=@" + str(expo).replace("\\", "/")]

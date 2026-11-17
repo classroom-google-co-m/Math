@@ -64,6 +64,18 @@ test('round 95: requirements become catalogue ids; a missing one leaves the mod 
     assert.deepEqual(cat2.mods.map((m) => m.id).sort(), ['needs-user', 'plain', 'the-api', 'uses-api']);
     assert.ok(readdirSync(join(out2, 'm')).includes('the-api.0.bin'), 'a kept entry brings its parts');
     assert.deepEqual(cat2.mods.find((m) => m.id === 'uses-api').requires, ['the-api'], 'a kept mod still satisfies a requirement');
+
+    // round 109: a kept entry keeps its own requirements when this build's --requires says
+    // nothing of it (the public catalogue lost three that way when one mod was added)
+    const sel3 = join(tmp, 'select3.txt'), req3 = join(tmp, 'requires3.json'), out3 = join(tmp, 'out3');
+    writeFileSync(sel3, 'plain_777777\n');
+    writeFileSync(req3, '{}');
+    pack([src, out3, '--requires', req3, '--select', sel3, '--keep', out2]);
+    const by3 = Object.fromEntries(JSON.parse(readFileSync(join(out3, 'catalogue.json'), 'utf8')).mods.map((m) => [m.id, m]));
+    assert.deepEqual(Object.keys(by3).sort(), ['needs-user', 'plain', 'the-api', 'uses-api']);
+    assert.deepEqual(by3['uses-api'].requires, ['the-api'], 'kept, and still requiring what it did');
+    assert.deepEqual(by3['needs-user'].requires, ['uses-api'], 'and so is the one that needs it');
+    assert.equal(by3['the-api'].requires, undefined);
   } finally {
     rmSync(tmp, { recursive: true, force: true });
   }
@@ -102,4 +114,35 @@ test('round 95: the page installs the chain and the browser shows what a mod req
   const ui = readFileSync(join(root, 'scripts', 'recomp', 'web', 'mod_browser.mjs'), 'utf8');
   assert.ok(ui.includes("wrapText(`REQUIRES ${it.requires.join(', ').toUpperCase()}`, width, (t) => measure(F10, t), 2)"), 'the detail page says it');
   assert.ok(ui.includes("const of = s.step ? `${s.step.at} OF ${s.step.of}  ` : '';"), 'and counts the chain while it downloads');
+});
+
+// round 123: --experimental marks an entry; the page's browser warns about that mod
+test('round 123: --experimental marks an entry by catalogue id or Workshop id, and a kept entry keeps its mark', { skip: !python && 'no python' }, () => {
+  const tmp = mkdtempSync(join(tmpdir(), 'isaac-modpack-exp-'));
+  try {
+    const src = join(tmp, 'src'), out = join(tmp, 'out'), out2 = join(tmp, 'out2'), out3 = join(tmp, 'out3');
+    mod(src, 'heavy_200001', { name: 'Heavy Mod', id: '200001', directory: 'heavy mod' });
+    mod(src, 'other_200002', { name: 'Other Mod', id: '200002', directory: 'other mod' });
+    mod(src, 'third_200003', { name: 'Third Mod', id: '200003', directory: 'third mod' });
+    const read = (dir) => Object.fromEntries(JSON.parse(readFileSync(join(dir, 'catalogue.json'), 'utf8')).mods.map((m) => [m.id, m]));
+    pack([src, out, '--experimental', 'heavy-mod', '--experimental', '200003']);
+    const by = read(out);
+    assert.equal(by['heavy-mod'].experimental, true, 'by catalogue id');
+    assert.equal(by['third-mod'].experimental, true, 'by Workshop id');
+    assert.equal('experimental' in by['other-mod'], false, 'no mark: no field');
+    // no flag: nothing is marked
+    pack([src, out2]);
+    assert.ok(Object.values(read(out2)).every((m) => !('experimental' in m)));
+    // --keep carries the mark of an entry this build does not make; a rebuilt entry has it only if named again
+    const sel = join(tmp, 'select.txt');
+    writeFileSync(sel, 'third_200003\n');
+    pack([src, out3, '--select', sel, '--keep', out]);
+    const by3 = read(out3);
+    assert.equal(by3['heavy-mod'].experimental, true, 'kept with its mark');
+    assert.equal('experimental' in by3['third-mod'], false, 'rebuilt without the flag: no mark');
+    // an id nothing has is an error, not a silent no-op
+    const r = spawnSync(python, [tool, src, join(tmp, 'out4'), '--experimental', 'no-such-mod'], { cwd: root, encoding: 'utf8', stdio: 'pipe', timeout: 120000 });
+    assert.notEqual(r.status, 0);
+    assert.match(r.stderr + r.stdout, /--experimental no-such-mod: no mod of this catalogue has that id/);
+  } finally { rmSync(tmp, { recursive: true, force: true }); }
 });

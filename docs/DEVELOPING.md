@@ -29,6 +29,7 @@ a room is ready to show. URL options:
 | `?stats=1` | Loading and runtime diagnostics |
 | `?saves=1` | A dialog for the whole save store |
 | `?persist=0` | Don't keep saves (for testing) |
+| `?mods=0` | Start with every mod switched off (they stay installed) |
 | `?decoders=<n>` | Decode helpers for the archive reader during the boot (default: cores − 2, at most 4; `0` decodes on the reader alone) |
 
 A build that ships its boot trail (the archive windows a boot reads) shows the
@@ -74,6 +75,24 @@ it, rumble played on the pad's vibration actuator. The page's own menus (EDIT
 FILE, the mod browser) take the d-pad, A and B while they are open, and the game
 sees a resting pad meanwhile.
 
+A pad that appears after the boot is connected by the game's hot-plug poller,
+which runs as a per-frame thread slice. Chrome on Android shows a pad to the
+page only after its first button press, so on a phone this is the only path.
+The slice runner abandons a slice at the idle lap of a lock loop. Before
+issue #12 that was a lock taken a third time with no host call between, and
+most imports are direct calls the runner never saw. So the connect callback
+`0x00a21d40` lost its slice on the logger's lock (six log lines), and then on
+a device handle's refcount lock. The pad was polled but never given to the
+game. Now `OutputDebugStringA` counts as progress, and an idle lap is 64
+repeats (`?ISAAC_IDLE_LAPS=<n>`; `?ISAAC_THR_TRACE=1` logs each idle-lap
+yield to the console). To check a phone with a pad that connects late:
+
+```sh
+node scripts/recomp/web/drive_pad.mjs http://127.0.0.1:8200/play.html               # phone, pad after the boot
+node scripts/recomp/web/drive_pad.mjs http://127.0.0.1:8200/play.html kind=desktop late=0
+node --test tests/recomp-pad-hotplug.test.js
+```
+
 ### Saves and mods
 
 - Saves and options live in IndexedDB and load before the engine starts.
@@ -90,13 +109,62 @@ sees a resting pad meanwhile.
 - Lua mods run on Lua 5.3.3 built into the host (`scripts/recomp/host/lua_build.py`);
   the game's calls into it go through `host_lua.c`, which formats `luaL_error`
   and `lua_pushfstring` arguments off the guest stack.
+- A mod that stops the game on the way in can be left behind without losing
+  anything: `?mods=0`, the error panel's "Reload without mods", or the question
+  the page asks before a boot when the last boot with mods on never reached the
+  game. Each switches the mods off in the store; none deletes one.
+
+### A REPENTOGON-compatible layer
+
+REPENTOGON itself cannot run on the port: it is built for game v1.9.7.12, the
+port is v1.9.7.17, and it patches machine code while the game runs. Its Lua
+functions and callbacks are being rebuilt for this executable instead, as a
+mod named `repentogon` ([`scripts/recomp/rgon`](../scripts/recomp/rgon/README.md)).
+The engine's part is `host_rgon.c` (a bridge handed to that mod's `rgon.lua`,
+hook slots, and a gate that shows `REPENTOGON` only to the mods the layer
+names); everything else is Lua and ships with the mod.
+
+```sh
+node scripts/recomp/rgon/pack.mjs .scratch/rgon/repentogon.zip
+node scripts/recomp/web/drive_stress.mjs "http://127.0.0.1:8200/play.html?ISAAC_RGON_ALLOW=zz-port-stress" output/recomp/rgon      phases=custom lua=scripts/recomp/rgon/test_layer.lua zips=.scratch/rgon/repentogon.zip
+node --test tests/recomp-rgon.test.js
+```
+
+`?ISAAC_RGON=0` keeps the layer from loading; `?ISAAC_RGON_ALLOW=<folder>,...`
+(or `*`) lets more mods see `REPENTOGON` for a test. Which mods see it is
+otherwise the layer's own decision from the page's reading of each mod's Lua
+(`scripts/recomp/rgon/README.md`, "What a mod sees"; `?ISAAC_RGON_AUTO=0` and
+`?modscan=0` switch that off):
+
+```sh
+node scripts/recomp/rgon/pack.mjs .scratch/rgon/repentogon.zip
+node scripts/recomp/rgon/tools/test_gate_auto.mjs "http://127.0.0.1:8200/play.html" .scratch/rgon/repentogon.zip <fresh out-dir>   # GATEAUTO END 108 0
+```
+
+A mod too large for the page's import (Fiend Folio: 22,858 files, 640 MB) is
+worked on from a dist's own instance tree, where files are read on demand:
+
+```sh
+python scripts/recomp/rgon/tools/dev_dist.py <dist> --layer --mod <StageAPI folder> --mod <Fiend Folio folder>
+node scripts/recomp/rgon/tools/load_probe.mjs "http://127.0.0.1:<port>/play.html?ISAAC_RGON_ALLOW=fiendfolio-reloaded" out          # until the mods have loaded
+node scripts/recomp/rgon/tools/load_probe.mjs "http://127.0.0.1:<port>/play.html?ISAAC_RGON_ALLOW=fiendfolio-reloaded" out run=1    # and into a run
+python scripts/recomp/rgon/tools/hook_table.py --write      # the hooked functions, each re-checked against the executable
+```
+
+Mods load in the order of their metadata `<name>`, as on a PC (round 103; before
+that the port loaded them in folder order, see
+[`recomp-architecture.md`](recomp-architecture.md) 21.133).
 
 ## Requirements
 
 - Your own copy of the game.
-- Python 3.11+ with `pypcode`, and Node.js 20+.
+- Python 3.11+ with `pypcode` 3.3.3 (`pip install pypcode==3.3.3`), and Node.js 20+.
+  Other versions number P-code temporaries differently, so the lift patches stop
+  matching; the lifter refuses them.
 - Emscripten 6.0.5+ with emsdk activated (set `EMSDK` if needed).
-- Ghidra and its Java runtime, for analysis and lifting.
+- Ghidra and its Java runtime, for analysis and lifting (set `GHIDRA_HOME`). The
+  export here was made with Ghidra 12.1.4 on Java 21; Homebrew's Ghidra 12.2 is
+  reported to need Java 25 (issue 21).
 - A C++20 `clang++` for the native decomp checks (`CLANGXX`/`EMXX` override it).
 - Playwright's Chromium for the browser drivers: `npx playwright install chromium`.
 
@@ -109,11 +177,25 @@ Everything generated stays local.
 ```sh
 npm install
 
+# The canonical executable, from a Steamless-unpacked copy of yours
+python scripts/recomp/prepare-input.py --input <unpacked-exe>
+
+# Ghidra's bulk export (about 50 min; scripts/recomp/README-export.md), the
+# import census and the PE index the lifter reads
+node scripts/recomp/export-all.mjs --stage all
+python scripts/recomp/census/run_all.py
+python scripts/decomp/tools/build-pe-index.py
+
 # Tables, memory image and host shims from your executable
 python scripts/recomp/host/boot_tables.py
 python scripts/recomp/host/memimage.py
 python scripts/recomp/host/verify_memimage.py
 python scripts/recomp/host/gen_shims.py
+
+# The lift's start list: Ghidra's functions, the code pointers in data, and the
+# functions only a code pointer reaches (without those, a mod stops on a trap)
+python scripts/recomp/lift/prepare_starts.py
+python scripts/recomp/lift/orphan_starts.py --write
 
 # Lift, then check the host
 python scripts/recomp/lift/lift_parallel.py --jobs 4 \
@@ -124,7 +206,7 @@ python scripts/recomp/lift/lift_parallel.py --jobs 4 \
     --shim-table output/recomp/host/shim-table.json \
     --va-file output/recomp/lift/starts_union.txt \
     --hand-written scripts/recomp/host/src/missing_fns.c \
-    --dispatch auto --max-insns 100000 --split-va 0x30000 --trace-va \
+    --dispatch auto --follow --max-insns 100000 --split-va 0x30000 --trace-va \
     --out output/recomp/lift/gu --module lifted \
     --stats output/recomp/lift/gu/stats.json
 python scripts/recomp/lift/patch_reentry.py --dir output/recomp/lift/gu \
@@ -175,6 +257,18 @@ rewrites the TUs in place, so build from a copy of the lift tree.
 The wasm memory starts at 640 MiB: the guest map below `0x1c000000`, then
 192 MiB for the host, whose measured peak is 128 MiB. A larger need, such as
 many mods, grows it.
+
+The guest heap is a 384 MiB arena, and the boot takes about 343 MiB of it
+(the sound catalogue's buffers are allocated up front). When it fills up, the
+allocator takes 64 MiB overflow segments from the host heap instead of
+answering NULL (`host_shims_heap.c`; `ISAAC_HEAP_OVERFLOW=0` turns that off).
+A mod's Lua heap lives in the same arena. `drive_stress.mjs ... heap=20`
+prints the heap report every 20 s of a walk.
+
+A `ret` in lifted code leaves its return address in `CpuState` (`s->EIP`):
+the replay loop that resumes the guest after a `longjmp` or a C++ catch
+(`isaac_guest_call_inner`) reads it after every frame. `apply_ret_eip` in
+`lift_patches.py` puts that store on the ret's own line, after call-slim.
 
 The unchanged-value path of `0x00a14c00` compares the first active matching
 uniform's latest payload using the incoming type's width. It performs no
@@ -258,6 +352,18 @@ node --test tests/recomp-touch.test.js tests/recomp-touch-game.test.js tests/rec
 node scripts/recomp/web/drive_interactive.mjs "http://127.0.0.1:8200/?frames=1500&persist=0" output/recomp/local-smoke
 node scripts/recomp/web/drive_boot.mjs "http://127.0.0.1:8200/play.html?ISAAC_EPOCH=1700000000" output/recomp/boot-check visits=2 cpu=4 gl=hw profile=0 timeout=600
 
+# Everything a player or a mod can make the game do, one thing at a time; the
+# engine's own log names the operation that stopped it (see the file's header)
+node scripts/recomp/web/drive_stress.mjs http://127.0.0.1:8200/play.html output/recomp/stress phases=qcards,qpills,luaerrs
+node scripts/recomp/web/drive_stress.mjs http://127.0.0.1:8200/play.html output/recomp/stress phases=tour catalogue=<catalogue-dir> mods=<id>
+# The alternate path as a player takes it (issue 16): boss, secret exit door, the
+# Secret Exit room, its trapdoor; here with the run continued after a page reload
+# (save= is an unlocked persistentgamedata1.dat; see the walk's header for set=)
+node scripts/recomp/web/drive_stress.mjs http://127.0.0.1:8200/play.html output/recomp/altpath phases=custom lua=scripts/recomp/web/altpath.lua catalogue=<catalogue-dir> mods=angels-drop-items,anticrash save=<dat> set=stages:new1b,reload:floor retries=1
+
+# The ways out of a mod that breaks the boot
+node scripts/recomp/web/drive_nomods.mjs http://127.0.0.1:8200/play.html output/recomp/nomods
+
 # CPU profile of a live session
 node scripts/recomp/web/profile_play.mjs "http://127.0.0.1:8200/?persist=0" output/recomp/local-profile cpu=1 gl=hw seconds=10
 ```
@@ -272,12 +378,24 @@ More drivers (saves, mods, floors, stress) are in
 # One HTML file with everything inside; works offline
 python scripts/recomp/assets/portable.py offline .scratch/game-dist .scratch/isaac.html
 
+# The same as one .svg file (opened directly in a browser; the page runs in an iframe inside it)
+python scripts/recomp/assets/portable.py svg .scratch/game-dist .scratch/isaac.svg
+
+# A small .svg (about 0.5 MB) that fetches the game from the CDN, as the GitHub Pages page does:
+# wrap a chunked page whose payload is at absolute URLs (from round 126's modules on)
+python scripts/recomp/assets/portable.py svg-wrap index.html .scratch/isaac-light.svg
+
 # A page plus payload chunks for a static host
 python scripts/recomp/assets/portable.py chunks .scratch/game-dist .scratch/portable-local --chunks 33 \
     --base https://cdn.jsdelivr.net/gh/chiikabu/boi-portable@main/c
 
 # Optional mod catalogue
 python scripts/recomp/assets/modpack.py <mods-dir> out/mods --base https://cdn.example.com/mods
+
+# The same, with one very large mod cut into packs the page fetches as the game reads them
+# (--boot-list: a JSON list of the files a boot reads, which go in the packs fetched at install)
+python scripts/recomp/assets/modpack.py <mods-dir> out/mods --packed <mod-folder> \
+    --requires requires.json --boot-list bootlist.json --keep <earlier-catalogue-dir>
 ```
 
 Chunks stay under jsDelivr's 20 MB file limit. They are lightly scrambled (not

@@ -54,7 +54,8 @@ export function cleanModName(s) {
 
 // Every word of the query must be somewhere in the name or the description; a
 // name that starts with a word beats one that has a word starting with it,
-// beats one that merely contains it, beats a description that does.
+// beats one that merely contains it (also with its spaces and punctuation
+// taken out, so a name typed as one word is found), beats a description that does.
 export function searchMods(items, query) {
   const words = cleanModText(query).toLowerCase().split(' ').filter(Boolean);
   if (!words.length) return items.slice();
@@ -62,11 +63,14 @@ export function searchMods(items, query) {
   for (const item of items) {
     const name = String(item.name || '').toLowerCase(), desc = String(item.desc || '').toLowerCase();
     const parts = name.split(/[^a-z0-9]+/).filter(Boolean);
+    const joined = parts.join('');                     // "fiendfolio" finds "Fiend Folio"
     let score = 0;
     for (const w of words) {
       if (name.startsWith(w)) score += 8;
       else if (parts.some((p) => p.startsWith(w))) score += 4;
-      else if (name.includes(w)) score += 2;
+      else if (name.includes(w) || joined.includes(w)) score += 2;
+      // round 123: the tag is found too, ahead of a description that merely has the letters
+      else if (item.experimental && w.length >= 3 && EXPERIMENTAL_TAG.toLowerCase().startsWith(w)) score += 3;
       else if (desc.includes(w)) score += 1;
       else { score = -1; break; }
     }
@@ -118,6 +122,10 @@ const DEFAULT_ART = {
   title: [22, 5, 214, 31],
 };
 const INK = [54, 47, 45], LIGHT = [140, 120, 120], HILITE = [212, 196, 202];
+// round 123: what a mod the catalogue marks "experimental": true is told to be (Fiend Folio:
+// it runs on the REPENTOGON-compatible layer, which lacks part of what it uses, and it is heavy)
+export const EXPERIMENTAL_TAG = 'EXPERIMENTAL';
+export const EXPERIMENTAL_NOTE = 'MAY BE BUGGY AND LAGGY';
 
 export function createModBrowser(opts) {
   const { stage, assetsUrl, readAsset } = opts;
@@ -324,11 +332,15 @@ export function createModBrowser(opts) {
         blit(A.art.cursor, l.x0 - 9, y - 1);
       }
       const busy = s.busyId === it.id;
-      const note = busy ? (s.progress != null ? `${s.progress}%` : '...') : '';
+      // round 108: an installed packed mod still downloading in the background says how far
+      // round 123: a mod the catalogue marks experimental says so where nothing else is said
+      const own = busy ? (s.progress != null ? `${s.progress}%` : '...') : (it.rowNote && it.rowNote !== 'INSTALLED' ? it.rowNote : '');
+      const tag = !own && it.experimental ? EXPERIMENTAL_TAG : '';
+      const note = own || tag;
       const noteW = note ? measure(F10, note) : 0;
       const nameW = l.x1 - (l.x0 + 10) - (noteW ? noteW + 8 : 0) - (it.installed ? 14 : 0);
-      text(F10, clip(F10, it.name, nameW), l.x0 + 10, y, it.big && !it.installed ? 'light' : 'ink');
-      if (note) text(F10, note, l.x1 - noteW, y);
+      text(F10, clip(F10, it.name, nameW), l.x0 + 10, y, (it.big || it.needsComputer) && !it.installed ? 'light' : 'ink');
+      if (note) text(F10, note, l.x1 - noteW - (tag && it.installed ? 14 : 0), y, tag ? 'light' : 'ink');
       if (it.installed) tick(l.x1 - 10, y + 2);
       st.regions.push({ kind: 'row', index: i, x: l.x0, y: y - 2, w: l.x1 - l.x0, h: 16 });
     }
@@ -376,7 +388,7 @@ export function createModBrowser(opts) {
     const nameLines = wrapText(it.name, width, (t) => measure(F16, t), 2);
     nameLines.forEach((line, i) => text(F16, line, d.x0, y + i * 22));
     y += nameLines.length * 22 + 4;
-    const meta = [it.version ? `VERSION ${it.version}` : '', it.bytes ? mib(it.bytes) : ''].filter(Boolean).join('    ');
+    const meta = [it.version ? `VERSION ${it.version}` : '', it.sizeNote || (it.bytes ? mib(it.bytes) : '')].filter(Boolean).join('    ');
     text(F10, clip(F10, meta, width), d.x0, y, 'light');
     y += 16;
     // round 95: the mods it needs, which installing it brings along
@@ -384,6 +396,20 @@ export function createModBrowser(opts) {
       const req = wrapText(`REQUIRES ${it.requires.join(', ').toUpperCase()}`, width, (t) => measure(F10, t), 2);
       req.forEach((line, i) => text(F10, line, d.x0, y - 2 + i * 12, 'light'));
       y += req.length * 12;
+    }
+    // round 123: a mod that runs here with known gaps says so before anything is installed
+    if (it.experimental) {
+      const tw = measure(F10, EXPERIMENTAL_TAG) + 8;
+      frame(d.x0, y, tw, 14, INK);
+      text(F10, EXPERIMENTAL_TAG, d.x0 + 4, y + 1);
+      // the note runs on from the tag: the words that fit beside it, the rest on lines of their own
+      const words = EXPERIMENTAL_NOTE.split(' ');
+      let beside = '';
+      while (words.length && measure(F10, beside ? `${beside} ${words[0]}` : words[0]) <= width - tw - 6) beside = beside ? `${beside} ${words.shift()}` : words.shift();
+      if (beside) text(F10, beside, d.x0 + tw + 6, y + 1);
+      const under = words.length ? wrapText(words.join(' '), width, (t) => measure(F10, t), 2) : [];
+      under.forEach((line, i) => text(F10, line, d.x0, y + 16 + i * 12));
+      y += 14 + under.length * 12 + 5;
     }
     rect(d.x0, y, width, 1, HILITE);
     y += 7;
@@ -429,6 +455,10 @@ export function createModBrowser(opts) {
       wrapText(sub, width - backW - 12, (t) => measure(F10, t), 2)
         .forEach((line, i) => text(F10, line, d.x0, actionY + 22 + i * 11, st.confirm === it.id ? 'ink' : 'light'));
       if (!done) st.regions.push({ kind: 'act', x: d.x0 - 4, y: actionY - 4, w: width + 8, h: 44 });
+    } else if (it.needsComputer) {
+      // a packed mod (Fiend Folio) on a phone: the game would run out of memory (mods.mjs smallDevice)
+      text(F10, 'NEEDS A COMPUTER', d.x0, actionY + 4);
+      text(F10, 'TOO MUCH MEMORY FOR A PHONE', d.x0, actionY + 18, 'light');
     } else if (it.big) {
       text(F10, 'TOO BIG FOR THE BROWSER', d.x0, actionY + 4);
       text(F10, 'THE GAME IS GIVEN 96 MB FOR MODS', d.x0, actionY + 18, 'light');
@@ -486,7 +516,7 @@ export function createModBrowser(opts) {
       Promise.resolve(st.ctl.remove(it.id)).then(draw, draw);
       return;
     }
-    if (it.big) return;
+    if (it.big || it.needsComputer) return;
     play('select');
     Promise.resolve(st.ctl.install(it.id)).then(draw, draw);
   }

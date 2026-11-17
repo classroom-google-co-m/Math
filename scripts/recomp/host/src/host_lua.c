@@ -128,22 +128,150 @@ static void *isaac_lua_alloc(void *ud, void *ptr, size_t osize, size_t nsize) {
 #define LUA_TRAMPOLINES 2048
 
 static uint32_t g_tramp_va[LUA_TRAMPOLINES];   /* guest lua_CFunction VA */
+static uint32_t g_tramp_gckey[LUA_TRAMPOLINES]; /* round 114: the key, when the function is a luabridge __gc (1d) */
 static unsigned g_tramp_n;
 
-static int call_guest_cfunction(lua_State *L, unsigned slot) {
-    uint32_t fn = g_tramp_va[slot];
+/* ---- 1b. where a guest C function's frame goes ---------------------------
+ *
+ * Round 100. Each trampoline used to run its guest function on a stack window
+ * fixed by its slot (TOP - 0x8000 - slot * 0x400), whatever the guest stack
+ * already held. A guest C function that re-enters itself through Lua then
+ * starts on its own live frame: the game's `include` (0x00860000) runs a mod
+ * file, and a file that calls `include` again (StageAPI's library.lua,
+ * room.lua and reimpl.lua; More Special Rooms in Greed's lib.lua) overwrote
+ * the outer include's locals, return address and saved registers. Its
+ * std::strings were then freed twice ("[heap] double free"), the guest heap
+ * corrupted and the boot hung.
+ *
+ * Every other host->guest call goes just below the caller's live ESP; this now
+ * does too. Each Lua shim records the guest ESP it was called with (the
+ * innermost guest code inside Lua), and a trampoline starts LUA_GUEST_GAP
+ * below the innermost record. Any shim can reach a trampoline -- a __gc
+ * finalizer, a metamethod, an error handler -- so every shim records.
+ *
+ * A Lua error longjmps past these records, and past the epilogue of the
+ * trampoline's isaac_guest_call, which would have put g_guest_call_esp and the
+ * guest jmp_buf back (round 95's C++ catch reads both). A record is therefore
+ * dropped once the host stack is back at or above it -- a live record encloses
+ * the current host frame, so it sits strictly above it -- and the oldest
+ * dropped trampoline's entry state is the state of the call control is back
+ * in. Missing a dead record only leaves a frame lower than needed. */
+#include <setjmp.h>
+#include <stdint.h>
+#include <stdlib.h>
+extern uint32_t g_guest_call_esp;
+extern void isaac_guest_jmp_save(void *dst);
+extern void isaac_guest_jmp_restore(const void *src);
+
+#define LUA_NEST_MAX   512u      /* Lua stops C nesting at LUAI_MAXCCALLS = 200 */
+#define LUA_GUEST_GAP  0x400u
+
+static struct { uintptr_t host; uint32_t esp; } g_shim_rec[LUA_NEST_MAX];
+static unsigned g_shim_n;
+static struct { uintptr_t host; uint32_t call_esp; jmp_buf jmp; } g_call_rec[LUA_NEST_MAX];
+static unsigned g_call_n;
+
+static void lua_nest_prune(uintptr_t here) {
+    while (g_shim_n && g_shim_rec[g_shim_n - 1].host <= here) --g_shim_n;
+    if (g_call_n && g_call_rec[g_call_n - 1].host <= here) {
+        unsigned i = g_call_n - 1;
+        while (i && g_call_rec[i - 1].host <= here) --i;
+        g_guest_call_esp = g_call_rec[i].call_esp;
+        isaac_guest_jmp_restore(g_call_rec[i].jmp);
+        g_call_n = i;
+    }
+}
+
+/* A shim's own record sits at its own frame, so the prune on its way out
+ * drops it along with whatever its Lua call abandoned. */
+static void lua_shim_enter(uintptr_t here, uint32_t esp) {
+    lua_nest_prune(here);
+    const unsigned n = g_shim_n;
+    if (n >= LUA_NEST_MAX) { isaac_shutdown("Lua shims nested deeper than LUA_NEST_MAX"); abort(); }
+    g_shim_rec[n].host = here;
+    g_shim_rec[n].esp = esp;
+    g_shim_n = n + 1;
+}
+
+static int call_guest_fn(lua_State *L, uint32_t fn, unsigned slot) {
+    volatile char anchor = 0;
+    const uintptr_t here = (uintptr_t)&anchor;
     CpuState cpu;
+    lua_nest_prune(here);
     memset(&cpu, 0, sizeof cpu);
     cpu.FS_OFFSET = ISAAC_TEB_VA;
-    /* A fresh stack window per re-entry: Lua may call us from arbitrary depth
-     * and the guest's own frame chain must not be clobbered. */
-    cpu.ESP = ISAAC_STACK_TOP_VA - 0x8000 - slot * 0x400;
+    if (g_shim_n) {
+        cpu.ESP = (g_shim_rec[g_shim_n - 1].esp - LUA_GUEST_GAP) & ~0xFu;
+    } else {
+        /* Lua entered by host code, not through a shim: no guest frame to
+         * stay below (only the selftest does this) */
+        static int said;
+        if (!said++) isaac_log("[isaac][lua] a guest C function called with no guest caller: the slot window");
+        cpu.ESP = ISAAC_STACK_TOP_VA - 0x8000 - slot * 0x400;
+    }
     cpu.ESP -= 4;
     isaac_w32(cpu.ESP, isaac_va(L));      /* the sole argument, cdecl */
     cpu.ESP -= 4;
     isaac_w32(cpu.ESP, 0);                /* return address */
+    const unsigned d = g_call_n;
+    if (d >= LUA_NEST_MAX) { isaac_shutdown("guest C functions nested deeper than LUA_NEST_MAX"); abort(); }
+    g_call_rec[d].host = here;
+    g_call_rec[d].call_esp = g_guest_call_esp;
+    isaac_guest_jmp_save(g_call_rec[d].jmp);
+    g_call_n = d + 1;
     isaac_guest_call(fn, &cpu);
+    g_call_n = d;                         /* isaac_guest_call put the state back itself */
     return (int)cpu.EAX;                  /* number of results */
+}
+static int lb_gc_native(lua_State *L, unsigned slot);     /* 1d */
+static int call_guest_cfunction(lua_State *L, unsigned slot) {
+    if (g_tramp_gckey[slot]) return lb_gc_native(L, slot);
+    return call_guest_fn(L, g_tramp_va[slot], slot);
+}
+
+/* Round 102: the same two things for host code that is not a trampoline
+ * (host_rgon.c).
+ *
+ * A host function Lua called -- a native of the REPENTOGON-compatible layer --
+ * calls a guest function: the frame goes where a trampoline's would, the
+ * arguments are pushed right to left over a return address of 0, and the call
+ * is recorded so a Lua error raised below it puts the guest-call state back.
+ * The caller sets the registers (ECX for a thiscall) and reads the results
+ * out of the same CpuState. */
+void isaac_lua_guest_invoke(uint32_t fn, CpuState *cpu, const uint32_t *args, unsigned nargs) {
+    volatile char anchor = 0;
+    const uintptr_t here = (uintptr_t)&anchor;
+    lua_nest_prune(here);
+    cpu->FS_OFFSET = ISAAC_TEB_VA;
+    cpu->ESP = g_shim_n ? (g_shim_rec[g_shim_n - 1].esp - LUA_GUEST_GAP) & ~0xFu
+                        : ISAAC_STACK_TOP_VA - 0x8000u;
+    for (unsigned i = nargs; i > 0; --i) { cpu->ESP -= 4; isaac_w32(cpu->ESP, args[i - 1]); }
+    cpu->ESP -= 4;
+    isaac_w32(cpu->ESP, 0);               /* return address */
+    const unsigned d = g_call_n;
+    if (d >= LUA_NEST_MAX) { isaac_shutdown("guest C functions nested deeper than LUA_NEST_MAX"); abort(); }
+    g_call_rec[d].host = here;
+    g_call_rec[d].call_esp = g_guest_call_esp;
+    isaac_guest_jmp_save(g_call_rec[d].jmp);
+    g_call_n = d + 1;
+    isaac_guest_call(fn, cpu);
+    g_call_n = d;
+}
+
+/* Guest code that enters Lua WITHOUT a shim: a hook of the layer runs inside
+ * a lifted function and calls a Lua handler itself. The guest frames live at
+ * that moment are below every record the shims made, so a trampoline placed
+ * from those records would land on them; the hook records its own guest ESP
+ * for as long as its Lua call lasts, exactly as a shim does. */
+void isaac_lua_host_enter(uintptr_t here, uint32_t guest_esp) { lua_shim_enter(here, guest_esp); }
+void isaac_lua_host_leave(uintptr_t here) { lua_nest_prune(here); }
+
+/* The selftest's view of the records: the innermost shim's guest ESP (0 when
+ * none) and the two depths. */
+uint32_t isaac_lua_nest_probe(unsigned *shims, unsigned *calls) {
+    if (shims) *shims = g_shim_n;
+    if (calls) *calls = g_call_n;
+    return g_shim_n ? g_shim_rec[g_shim_n - 1].esp : 0u;
 }
 
 /* 512 DISTINCT static functions. Lua compares closure identities by the
@@ -671,10 +799,409 @@ static const lua_CFunction g_tramp[LUA_TRAMPOLINES] = {
     TREF(2040), TREF(2041), TREF(2042), TREF(2043), TREF(2044), TREF(2045), TREF(2046), TREF(2047),
 };
 
+/* ---- 1c. round 111: luabridge's __index, native --------------------------
+ *
+ * 0x0085cd40 is the __index metamethod of every class the game binds
+ * (luabridge's instance lookup). With Fiend Folio loaded it was about 15% of
+ * the game's busy time inclusive, each `entity.Position` or `player:Method`
+ * a dozen Lua shims called from lifted code. Here it is the same sequence of
+ * Lua API calls made directly, translated from the instruction stream
+ * (indices as the code has them; [1] the object, [2] the key):
+ *
+ *   0x0085cd4c  lua_getmetatable(L, 1)          (the result is not tested)
+ *   0x0085cd55  pushvalue(2); rawget(-2)        mt[key]
+ *   0x0085cd67  iscfunction(-1) -> 0x0085ce85: rotate(-2, -1); settop(-2); return 1
+ *   loop 0x0085cd87:
+ *     lua_type(-1) != nil                       -> 0x0085ceb0 "not a cfunction" (C++ throw)
+ *     settop(-2); t = absindex(-1); pushstring "__propget"; rawget(t)
+ *     lua_type(-1) != table (5)                 -> 0x0085cef4 "missing __propget table"
+ *     pushvalue(2); rawget(-2); rotate(-2, -1); settop(-2)
+ *     iscfunction(-1) -> 0x0085cebf: rotate(-2, -1); settop(-2); pushvalue(1);
+ *                        lua_callk(L, 1, 1, 0, 0); return 1
+ *     lua_type(-1) != nil                       -> "not a cfunction"
+ *     settop(-2); t = absindex(-1); pushstring "__parent"; rawget(t)
+ *     lua_type(-1) != table: nil -> 0x0085ce98 return 1 (the nil);
+ *                            else -> 0x0085cf03 "__parent is not a table"
+ *     rotate(-2, -1); settop(-2); pushvalue(2); rawget(-2)
+ *     iscfunction(-1) -> 0x0085ce85 (as above); else back to the loop
+ *
+ * Everything up to a result is a raw read (rawget runs no metamethod,
+ * pushstring only interns), so on the ways that end in a throw -- and when
+ * [1] has no metatable, where the guest goes on with a stack it did not
+ * expect -- the stack is put back as it came and the lifted function runs
+ * instead: errors stay the game's own. The getter call is the one thing
+ * with effects, and it is the same lua_callk the guest makes.
+ *
+ * ISAAC_LUA_NATIVE=0 keeps the trampoline (the lifted function); =2 runs the
+ * lifted function for the result and checks the native lookup against it
+ * (a getter is then called twice, once by each). */
+#define ISAAC_LB_INDEX_VA 0x0085cd40u
+enum { IX_DIRECT = 0, IX_GETTER = 1, IX_NIL = 2, IX_GUEST = 3 };
+static int g_native_mode = -1;
+static int lua_native_mode(void) {
+    int v = g_native_mode;
+    if (v < 0) {
+        const char *e = getenv("ISAAC_LUA_NATIVE");
+        v = (e && *e >= '0' && *e <= '2') ? *e - '0' : 1;
+        isaac_log("[isaac][lua] round 111: luabridge __index (0x%08x) %s", ISAAC_LB_INDEX_VA,
+                  v == 0 ? "runs as lifted code (ISAAC_LUA_NATIVE=0)" :
+                  v == 1 ? "runs natively" : "runs as lifted code and natively, compared (ISAAC_LUA_NATIVE=2)");
+        g_native_mode = v;
+    }
+    return v;
+}
+/* The lookup without the getter's call: leaves one value above top0 (the
+ * function found, the getter, or the nil that ends the chain) and says which;
+ * IX_GUEST leaves the stack at top0. */
+static int lb_index_resolve(lua_State *L, int top0) {
+    if (!lua_getmetatable(L, 1)) return IX_GUEST;
+    lua_pushvalue(L, 2);
+    lua_rawget(L, -2);
+    for (;;) {
+        if (lua_iscfunction(L, -1)) {
+            lua_rotate(L, -2, -1);
+            lua_settop(L, -2);
+            return IX_DIRECT;
+        }
+        if (lua_type(L, -1) != LUA_TNIL) break;                /* "not a cfunction" */
+        lua_settop(L, -2);
+        int t = lua_absindex(L, -1);
+        lua_pushstring(L, "__propget");
+        lua_rawget(L, t);
+        if (lua_type(L, -1) != LUA_TTABLE) break;              /* "missing __propget table" */
+        lua_pushvalue(L, 2);
+        lua_rawget(L, -2);
+        lua_rotate(L, -2, -1);
+        lua_settop(L, -2);
+        if (lua_iscfunction(L, -1)) {
+            lua_rotate(L, -2, -1);
+            lua_settop(L, -2);
+            return IX_GETTER;
+        }
+        if (lua_type(L, -1) != LUA_TNIL) break;                /* "not a cfunction" */
+        lua_settop(L, -2);
+        t = lua_absindex(L, -1);
+        lua_pushstring(L, "__parent");
+        lua_rawget(L, t);
+        int ty = lua_type(L, -1);
+        if (ty != LUA_TTABLE) {
+            if (ty != LUA_TNIL) break;                         /* "__parent is not a table" */
+            lua_rotate(L, -2, -1);                             /* the nil, alone above top0 */
+            lua_settop(L, -2);
+            return IX_NIL;
+        }
+        lua_rotate(L, -2, -1);
+        lua_settop(L, -2);
+        lua_pushvalue(L, 2);
+        lua_rawget(L, -2);
+    }
+    lua_settop(L, top0);
+    return IX_GUEST;
+}
+/* the lifted function, for the ways the native one does not take (the
+ * selftest, which has no lifted code, puts its own here) */
+static int (*g_lb_guest)(lua_State *L, uint32_t fn, unsigned slot) = call_guest_fn;
+static uint32_t g_ix_n[4], g_ix_checked, g_ix_bad;
+/* two results the same: raw-equal, or two NaNs, or two userdata with one
+ * metatable and the same bytes (a getter makes a new Vector each call), or
+ * two tables (a getter that makes a new table) */
+static int lb_same(lua_State *L, int a, int b) {
+    if (lua_rawequal(L, a, b)) return 1;
+    int ta = lua_type(L, a), tb = lua_type(L, b);
+    if (ta != tb) return 0;
+    if (ta == LUA_TNUMBER) { lua_Number x = lua_tonumber(L, a), y = lua_tonumber(L, b); return x != x && y != y; }
+    if (ta == LUA_TTABLE) return 1;
+    if (ta == LUA_TUSERDATA) {
+        /* luabridge's value userdata (a Vector a getter returns) keeps a
+         * pointer to its own storage inside the block: a word that differs
+         * is the same if it points the same distance into each block */
+        size_t n = lua_rawlen(L, a), i = 0;
+        if (n != lua_rawlen(L, b)) return 0;
+        const unsigned char *pa = lua_touserdata(L, a), *pb = lua_touserdata(L, b);
+        for (; i + 4u <= n; i += 4u) {
+            uint32_t wa, wb;
+            memcpy(&wa, pa + i, 4); memcpy(&wb, pb + i, 4);
+            if (wa == wb) continue;
+            uint32_t ra = wa - (uint32_t)(uintptr_t)pa, rb = wb - (uint32_t)(uintptr_t)pb;
+            if (ra != rb || ra >= n) return 0;
+        }
+        if (memcmp(pa + i, pb + i, n - i)) return 0;
+        int ma = lua_getmetatable(L, a), mb = lua_getmetatable(L, b);
+        int same = ma == mb && (!ma || lua_rawequal(L, -1, -2));
+        lua_settop(L, -1 - ma - mb);
+        return same;
+    }
+    return 0;
+}
+static int lb_index_native(lua_State *L) {
+    const int top0 = lua_gettop(L);
+    const int mode = lua_native_mode();
+    if (mode == 0) return g_lb_guest(L, ISAAC_LB_INDEX_VA, 0);
+    const int kind = lb_index_resolve(L, top0);
+    ++g_ix_n[kind];
+    if (mode == 1) {
+        if (kind == IX_GUEST) return g_lb_guest(L, ISAAC_LB_INDEX_VA, 0);
+        if (kind == IX_GETTER) {
+            lua_pushvalue(L, 1);
+            lua_callk(L, 1, 1, 0, NULL);
+        }
+        return 1;
+    }
+    /* verify: the lifted function's answer is the one returned */
+    if (kind == IX_GUEST) return g_lb_guest(L, ISAAC_LB_INDEX_VA, 0);
+    const int found = top0 + 1;
+    int nres = g_lb_guest(L, ISAAC_LB_INDEX_VA, 0);
+    const int res = lua_gettop(L);
+    int ok = nres == 1 && res > found;
+    if (ok && kind == IX_GETTER) {
+        lua_pushvalue(L, found);
+        lua_pushvalue(L, 1);
+        lua_callk(L, 1, 1, 0, NULL);
+        ok = lb_same(L, -1, res);
+        lua_settop(L, -2);
+    } else if (ok) {
+        ok = lb_same(L, found, res);
+    }
+    ++g_ix_checked;
+    if (!ok) {
+        ++g_ix_bad;
+        if (g_ix_bad <= 20u)
+            isaac_log("[isaac][lua] __index MISMATCH #%u: key %s (%s) on a %s: native %s %s, lifted %d result(s) %s",
+                      g_ix_bad, lua_type(L, 2) == LUA_TSTRING ? lua_tostring(L, 2) : "?", luaL_typename(L, 2),
+                      luaL_typename(L, 1), kind == IX_DIRECT ? "found" : kind == IX_GETTER ? "getter" : "nil",
+                      luaL_typename(L, found), nres, res > found ? luaL_typename(L, res) : "-");
+    }
+    if (g_ix_checked == 1000u || g_ix_checked == 10000u || g_ix_checked % 200000u == 0u)
+        isaac_log("[isaac][lua] __index verify: %u lookups compared, %u mismatch(es); native kinds found %u, getter %u, nil %u, lifted %u",
+                  g_ix_checked, g_ix_bad, g_ix_n[IX_DIRECT], g_ix_n[IX_GETTER], g_ix_n[IX_NIL], g_ix_n[IX_GUEST]);
+    return nres;
+}
+/* the selftest's handles */
+lua_CFunction isaac_lua_native_index(void) { return lb_index_native; }
+void isaac_lua_native_set_mode(int mode) { g_native_mode = mode; }
+void isaac_lua_native_set_guest(int (*fn)(lua_State *L, uint32_t va, unsigned slot)) { g_lb_guest = fn ? fn : call_guest_fn; }
+void isaac_lua_native_counts(uint32_t out[6]) {
+    for (int i = 0; i < 4; ++i) out[i] = g_ix_n[i];
+    out[4] = g_ix_checked; out[5] = g_ix_bad;
+}
+
+/* ---- 1d. round 114: luabridge's __gc, native for a destructor that does nothing
+ *
+ * Every class the game binds gets a __gc: 66 functions of one 31-byte shape
+ * (0x008c2bd0..0x008c32b0 and 0x008c5b90..0x008c5cb0, differing in the key
+ * they push), each
+ *     ud = sub_0085c3e0(L, key);     the exact-class check; returns the block
+ *     ud->vtable[0](0);              the object's destructor, without delete
+ *     return 0;
+ * A collection finalizes one userdata per call, and with a big mod that is
+ * hundreds of thousands of calls into lifted code per cycle, run by Lua in
+ * batches that double (lgc.c runafewfinalizers): one batch was 100 to 400 ms.
+ *
+ * 36 luabridge Userdata vtables exist (RTTI), each with the one slot. For 29
+ * of them -- UserdataPtr (every pointer to a game object), Vector, Color,
+ * KColor, EntityRef, RNG, the params and the enum and proxy values -- slot 0
+ * is one 36- or 39-byte body that, called with 0, only stores the base
+ * vtable 0x00b753c0 into the object:
+ *     push ebp; mov ebp, esp; test byte [ebp+8], 1; push esi; mov esi, ecx
+ *     mov dword [esi], 0x00b753c0
+ *     jz +N; push size; push esi; call 0x00aef15c; add esp, 8
+ *     mov eax, esi; pop esi; pop ebp; ret 4
+ * Here a __gc of that shape, for an object whose slot 0 is that body, is the
+ * check and that one store, made by host code. The check is 0x0085c3e0's own
+ * sequence (0x0085c3e0..0x0085c4c4): the class table registry[key], the
+ * object's metatable, mt[0x00c7f4b8] a boolean, the two tables raw-equal or
+ * class["__const"] raw-equal to the metatable. Anything else -- another
+ * destructor (EntityPtr, Sprite, Font, PathFinder, EntityList, HomingLaser,
+ * FontRenderSettings), no metatable, a mismatch (the game raises
+ * luaL_argerror) -- runs the lifted function as before.
+ *
+ * Both shapes are read off the guest image when a __gc is first registered
+ * or a vtable first seen; a build whose bytes differ takes the lifted path.
+ * ISAAC_LUA_NATIVE=0 keeps the lifted function for everything; =2 runs the
+ * lifted function too and checks that it left the store the native path
+ * would have made. */
+#define ISAAC_LB_GETEXACT_VA   0x0085c3e0u
+#define ISAAC_LB_DELETE_VA     0x00aef15cu
+#define ISAAC_LB_CLASSFLAG_VA  0x00c7f4b8u
+static uint32_t g_gcn_native, g_gcn_guest, g_gcn_checked, g_gcn_bad;
+/* the key a __gc of the template's shape pushes, or 0 */
+uint32_t isaac_lua_gc_template_key(uint32_t va) {
+    static const uint8_t head[7] = { 0x55, 0x8b, 0xec, 0x8b, 0x4d, 0x08, 0x68 };
+    static const uint8_t tail[15] = { 0x83, 0xc4, 0x04, 0x8b, 0xc8, 0x8b, 0x10, 0x6a, 0x00, 0xff, 0x12, 0x33, 0xc0, 0x5d, 0xc3 };
+    if (!isaac_is_guest_va(va) || !isaac_is_guest_va(va + 30u)) return 0u;
+    const uint8_t *p = (const uint8_t *)isaac_g(va);
+    if (memcmp(p, head, sizeof head) || p[11] != 0xe8 || memcmp(p + 16, tail, sizeof tail)) return 0u;
+    uint32_t key, rel;
+    memcpy(&key, p + 7, 4); memcpy(&rel, p + 12, 4);
+    if (va + 16u + rel != ISAAC_LB_GETEXACT_VA) return 0u;
+    return key;
+}
+/* the vtable a destructor body of the trivial shape stores, or 0 */
+uint32_t isaac_lua_gc_trivial_dtor(uint32_t fn) {
+    static const uint8_t head[12] = { 0x55, 0x8b, 0xec, 0xf6, 0x45, 0x08, 0x01, 0x56, 0x8b, 0xf1, 0xc7, 0x06 };
+    static const uint8_t tail[10] = { 0x83, 0xc4, 0x08, 0x8b, 0xc6, 0x5e, 0x5d, 0xc2, 0x04, 0x00 };
+    if (!isaac_is_guest_va(fn) || !isaac_is_guest_va(fn + 38u)) return 0u;
+    const uint8_t *p = (const uint8_t *)isaac_g(fn);
+    if (memcmp(p, head, sizeof head) || p[16] != 0x74) return 0u;
+    unsigned at;                                  /* the offset of `push esi` */
+    if (p[18] == 0x6a) at = 20u;                  /* push imm8 */
+    else if (p[18] == 0x68) at = 23u;             /* push imm32 */
+    else return 0u;
+    if (p[17] != at - 18u + 9u) return 0u;        /* jz over the push, push, call, add: to `mov eax, esi` */
+    if (p[at] != 0x56 || p[at + 1u] != 0xe8 || memcmp(p + at + 6u, tail, sizeof tail)) return 0u;
+    uint32_t rel, vt;
+    memcpy(&rel, p + at + 2u, 4);
+    if (fn + at + 6u + rel != ISAAC_LB_DELETE_VA) return 0u;
+    memcpy(&vt, p + 12, 4);
+    return vt;
+}
+/* a vtable's verdict, remembered: what its destructor stores, or 0 */
+#define GCN_CACHE 64u
+static struct { uint32_t vt, stores; } g_gcn_cache[GCN_CACHE];
+static uint32_t gcn_vtable(uint32_t vt) {
+    const unsigned h = (vt >> 2) & (GCN_CACHE - 1u);
+    if (g_gcn_cache[h].vt == vt) return g_gcn_cache[h].stores;
+    uint32_t stores = 0u;
+    if (isaac_is_guest_va(vt) && isaac_is_guest_va(vt + 3u)) stores = isaac_lua_gc_trivial_dtor(isaac_r32(vt));
+    g_gcn_cache[h].vt = vt; g_gcn_cache[h].stores = stores;
+    return stores;
+}
+/* 0x0085c3e0's way to "this is an object of the class": 1 = it is; the stack is left as it came */
+static int gcn_exact(lua_State *L, uint32_t key) {
+    const int top0 = lua_gettop(L);
+    int ok = 0;
+    lua_rawgetp(L, LUA_REGISTRYINDEX, isaac_g(key));
+    if (lua_isuserdata(L, 1) && lua_getmetatable(L, 1)) {
+        lua_rawgetp(L, -1, isaac_g(ISAAC_LB_CLASSFLAG_VA));
+        if (lua_type(L, -1) == LUA_TBOOLEAN) {
+            lua_settop(L, -2);
+            if (lua_rawequal(L, -1, -2)) ok = 1;
+            else if (lua_type(L, top0 + 1) == LUA_TTABLE) {
+                lua_pushstring(L, "__const");
+                lua_rawget(L, top0 + 1);
+                ok = lua_rawequal(L, -1, -2);
+            }
+        }
+    }
+    lua_settop(L, top0);
+    return ok;
+}
+/* a trampoline whose guest function is a __gc of the template's shape */
+static int lb_gc_native(lua_State *L, unsigned slot) {
+    const uint32_t key = g_tramp_gckey[slot];
+    const int mode = lua_native_mode();
+    uint32_t stores = 0u, *ud = NULL;
+    if (mode != 0 && lua_type(L, 1) == LUA_TUSERDATA && lua_rawlen(L, 1) >= 4u) {
+        ud = (uint32_t *)lua_touserdata(L, 1);
+        stores = gcn_vtable(ud[0]);
+        if (stores && !gcn_exact(L, key)) stores = 0u;
+    }
+    if (stores && mode == 1) {
+        ud[0] = stores;                           /* the destructor's one effect */
+        ++g_gcn_native;
+        return 0;
+    }
+    ++g_gcn_guest;
+    const int n = g_lb_guest(L, g_tramp_va[slot], slot);
+    if (stores && mode == 2) {                    /* verify: the lifted function made that store, and returned nothing */
+        ++g_gcn_checked;
+        if (n != 0 || ud[0] != stores) {
+            ++g_gcn_bad;
+            if (g_gcn_bad <= 20u)
+                isaac_log("[isaac][lua] __gc MISMATCH #%u: key 0x%08x, lifted returned %d and left vtable 0x%08x (native would store 0x%08x)",
+                          g_gcn_bad, key, n, ud[0], stores);
+        }
+        if (g_gcn_checked == 1000u || g_gcn_checked % 500000u == 0u)
+            isaac_log("[isaac][lua] __gc verify: %u finalizers compared, %u mismatch(es); %u went to the game alone",
+                      g_gcn_checked, g_gcn_bad, g_gcn_guest - g_gcn_checked);
+    }
+    return n;
+}
+void isaac_lua_gc_native_counts(uint32_t out[4]) {
+    out[0] = g_gcn_native; out[1] = g_gcn_guest; out[2] = g_gcn_checked; out[3] = g_gcn_bad;
+}
+
+/* ---- 1e. round 114: such an object is not marked for finalization at all ---
+ *
+ * Lua marks a userdata for finalization when it is given a metatable that
+ * has a __gc (lapi.c lua_setmetatable, luaC_checkfinalizer): a dead one is
+ * then kept for a cycle, its __gc called, and freed in the next. With the
+ * destructor above that call does one store into a block that is about to be
+ * freed and that nothing reads again (the vtable has the one slot, and every
+ * use of a block goes through [block+4]: 21.143). So when the game sets a
+ * class table on an object whose destructor is that trivial one, and the
+ * table's __gc is one of the template's for that very class, the metatable
+ * is set without the mark (host_lua_gcstate.c). The object is collected like
+ * a string: no finalizer call, and its memory back in the cycle it died in.
+ * An object the game constructs after setting its metatable, or of another
+ * destructor, keeps the mark and takes 1d's way.
+ * ISAAC_LUA_NOFIN=0 marks everything as Lua does; ISAAC_LUA_NATIVE=0 and =2
+ * do too (they are for comparing against the lifted __gc). */
+extern int isaac_lua_setmetatable_nofin(lua_State *L, int idx);   /* host_lua_gcstate.c */
+static int g_nofin = -1;
+static uint32_t g_nofin_n, g_nofin_marked;
+/* the class table on top of the stack: 1 when its __gc is a template __gc
+ * whose own class check accepts an object with this table (remembered by the
+ * table's address; the game's class tables are made once and kept) */
+#define NOFIN_CACHE 256u
+static struct { const void *mt; int ok; } g_nofin_cache[NOFIN_CACHE];
+static int nofin_class(lua_State *L) {
+    const void *mt = lua_topointer(L, -1);
+    const unsigned h = (unsigned)(((uintptr_t)mt >> 4) & (NOFIN_CACHE - 1u));
+    if (g_nofin_cache[h].mt == mt) return g_nofin_cache[h].ok;
+    const int top0 = lua_gettop(L);
+    int ok = 0;
+    lua_pushstring(L, "__gc");
+    lua_rawget(L, top0);
+    const lua_CFunction f = lua_tocfunction(L, -1);
+    uint32_t key = 0u;
+    if (f) for (unsigned i = 0; i < g_tramp_n; ++i) if (g_tramp[i] == f) { key = g_tramp_gckey[i]; break; }
+    lua_settop(L, top0);
+    if (key) {                                    /* 0x0085c3e0's check, of the table instead of an object's */
+        lua_rawgetp(L, top0, isaac_g(ISAAC_LB_CLASSFLAG_VA));
+        if (lua_type(L, -1) == LUA_TBOOLEAN) {
+            lua_settop(L, top0);
+            lua_rawgetp(L, LUA_REGISTRYINDEX, isaac_g(key));
+            if (lua_rawequal(L, -1, top0)) ok = 1;
+            else if (lua_type(L, -1) == LUA_TTABLE) {
+                lua_pushstring(L, "__const");
+                lua_rawget(L, -2);
+                ok = lua_rawequal(L, -1, top0);
+            }
+        }
+        lua_settop(L, top0);
+    }
+    g_nofin_cache[h].mt = mt; g_nofin_cache[h].ok = ok;
+    return ok;
+}
+void isaac_lua_nofin_set(int on) { g_nofin = on; memset(g_nofin_cache, 0, sizeof g_nofin_cache); }
+void isaac_lua_nofin_counts(uint32_t out[2]) { out[0] = g_nofin_n; out[1] = g_nofin_marked; }
+/* the game's lua_setmetatable */
+int isaac_lua_setmetatable(lua_State *L, int idx) {
+    if (g_nofin < 0) {
+        const char *e = getenv("ISAAC_LUA_NOFIN");
+        g_nofin = (e && *e == '0') ? 0 : 1;
+        if (!g_nofin) isaac_log("[isaac][lua] ISAAC_LUA_NOFIN=0: every object with a __gc is marked for finalization");
+    }
+    if (g_nofin && lua_native_mode() == 1 && lua_type(L, -1) == LUA_TTABLE && lua_type(L, idx) == LUA_TUSERDATA && lua_rawlen(L, idx) >= 4u) {
+        uint32_t vt;
+        memcpy(&vt, lua_touserdata(L, idx), 4);
+        if (gcn_vtable(vt) && nofin_class(L) && isaac_lua_setmetatable_nofin(L, idx)) {
+            ++g_nofin_n;
+            return 1;
+        }
+        ++g_nofin_marked;
+    }
+    return lua_setmetatable(L, idx);
+}
+
 /* Distinct guest functions are deduplicated, so a game registering the same
- * method repeatedly does not exhaust the pool. */
+ * method repeatedly does not exhaust the pool. Round 111: luabridge's
+ * __index is the native function above (one host address, as the
+ * trampoline was; its upvalues, if any, are the closure's as before). */
 static lua_CFunction trampoline_for(uint32_t guest_va) {
     if (!guest_va) return NULL;
+    if (guest_va == ISAAC_LB_INDEX_VA) return lb_index_native;
     for (unsigned i = 0; i < g_tramp_n; ++i)
         if (g_tramp_va[i] == guest_va) return g_tramp[i];
     if (g_tramp_n >= LUA_TRAMPOLINES) {
@@ -685,6 +1212,7 @@ static lua_CFunction trampoline_for(uint32_t guest_va) {
         return NULL;
     }
     g_tramp_va[g_tramp_n] = guest_va;
+    g_tramp_gckey[g_tramp_n] = isaac_lua_gc_template_key(guest_va);
     return g_tramp[g_tramp_n++];
 }
 
@@ -692,7 +1220,16 @@ unsigned isaac_lua_trampolines_used(void) { return g_tramp_n; }
 
 /* ---- the 59 bindings ---------------------------------------------------- */
 
-#define LUA_SHIM(name) void imp_lua5_3_3r__##name(CpuState *restrict cpu)
+/* Round 100: each shim records its guest ESP for the trampolines (1b above). */
+#define LUA_SHIM(name) \
+    static void lua_shim_##name(CpuState *restrict cpu); \
+    void imp_lua5_3_3r__##name(CpuState *restrict cpu) { \
+        volatile char anchor_ = 0; \
+        lua_shim_enter((uintptr_t)&anchor_, cpu->ESP); \
+        lua_shim_##name(cpu); \
+        lua_nest_prune((uintptr_t)&anchor_); \
+    } \
+    static void lua_shim_##name(CpuState *restrict cpu)
 
 /* state */
 LUA_SHIM(luaL_newstate) {
@@ -714,7 +1251,10 @@ LUA_SHIM(lua_newstate) {
                   "guest-addressable).", guest_alloc);
     ret_ptr(cpu, lua_newstate(isaac_lua_alloc, NULL));
 }
-LUA_SHIM(lua_close)      { lua_close(L_ARG(0)); cpu->EAX = 0; }
+/* round 102: the layer's hooks hold references into a state that is going away */
+void isaac_rgon_on_close(lua_State *L);
+void isaac_rgon_before_chunk(lua_State *L, const char *chunkname);
+LUA_SHIM(lua_close)      { isaac_rgon_on_close(L_ARG(0)); lua_close(L_ARG(0)); cpu->EAX = 0; }
 LUA_SHIM(luaL_openlibs)  { luaL_openlibs(L_ARG(0)); cpu->EAX = 0; }
 LUA_SHIM(lua_atpanic)    {
     ret_ptr(cpu, (const void *)(uintptr_t)0);
@@ -832,7 +1372,7 @@ LUA_SHIM(lua_len)         { lua_len(L_ARG(0), I_ARG(1)); cpu->EAX = 0; }
 LUA_SHIM(lua_getglobal)   { cpu->EAX = (uint32_t)lua_getglobal(L_ARG(0), S_ARG(1)); }
 LUA_SHIM(lua_setglobal)   { lua_setglobal(L_ARG(0), S_ARG(1)); cpu->EAX = 0; }
 LUA_SHIM(lua_getmetatable){ cpu->EAX = (uint32_t)lua_getmetatable(L_ARG(0), I_ARG(1)); }
-LUA_SHIM(lua_setmetatable){ cpu->EAX = (uint32_t)lua_setmetatable(L_ARG(0), I_ARG(1)); }
+LUA_SHIM(lua_setmetatable){ cpu->EAX = (uint32_t)isaac_lua_setmetatable(L_ARG(0), I_ARG(1)); }   /* 1e */
 LUA_SHIM(lua_newuserdata) { ret_ptr(cpu, lua_newuserdata(L_ARG(0), (size_t)isaac_arg(cpu, 1))); }
 
 /* calls */
@@ -845,7 +1385,358 @@ LUA_SHIM(lua_callk) {
 LUA_SHIM(lua_pcallk) {
     cpu->EAX = (uint32_t)lua_pcallk(L_ARG(0), I_ARG(1), I_ARG(2), I_ARG(3), 0, NULL);
 }
-LUA_SHIM(lua_gc)      { cpu->EAX = (uint32_t)lua_gc(L_ARG(0), I_ARG(1), I_ARG(2)); }
+/* ---- 1f. round 121: luabridge's class check (0x0085c590), natively -------
+ *
+ * Every bound method and property the game gives Lua starts by asking
+ * 0x0085c590 whether the value at a stack index is an object of the class
+ * it was written for (937 call sites). ECX = L, EDX = the index, [esp+4] the
+ * class's registry key, [esp+8] a byte "may be a const object"; EAX = the
+ * userdata's block, plain ret. The body, from its instructions:
+ *
+ *   rawgetp(REGISTRY, key)                           the class's table
+ *   isuserdata(index) == 0                           -> the error below
+ *   getmetatable(index); rawgetp(-1, 0x00c7f4b8)
+ *   type(-1) != boolean                              -> the error below
+ *   settop(-2)
+ *   rawget(metatable, "__const"); is_const = (its type is nil); settop(-2)
+ *   is_const: the class's table is replaced by its "__const" table
+ *   loop: rawequal(metatable, class)
+ *           yes: settop(-3); is_const and not "may be const"
+ *                -> luaL_argerror("cannot be const"); else
+ *                EAX = touserdata(index)
+ *           no:  rawget(metatable, "__parent"): nil -> the error below;
+ *                else it takes the metatable's place, and again
+ *   error: luaL_argerror("<__type of the class> expected, got <...>")
+ *
+ * In a Fiend Folio fight the lifted function and the Lua calls under it are
+ * 10% of the busy time (perf-run-ff.mjs on engine n8, inclusive): some
+ * twenty calls of the Lua API through the import shims for every method a
+ * mod calls. Here the way to "yes" is walked with the same raw reads on the
+ * host's side, the stack is put back as it came, and the answer is given
+ * only when it is yes and nothing is raised; every other way (not a
+ * userdata, no metatable, not a class of luabridge's, another class, a const
+ * object where none may be, an index that is not a plain positive one) the
+ * stack is put back and the lifted function runs, so the errors stay the
+ * game's own. ISAAC_LUA_NATIVE=0 keeps the lifted function; =2 runs it for
+ * the result and compares the native answer with it (a lifted run that is
+ * unwound by a Lua error before it returns is counted apart). */
+#define ISAAC_LB_GETCLASS_VA 0x0085c590u
+static uint32_t g_gcl_native, g_gcl_guest, g_gcl_mismatch, g_gcl_unreturned;
+/* mode 2: the calls whose lifted run is awaited, innermost last (a class
+ * check can run inside another's lifted body: its Lua calls may step the
+ * collector, and a finalizer is guest code). A call is known by the stack
+ * pointer it was entered with. */
+#define GCL_NEST 32u
+static struct { uint32_t esp, expect, ret; } g_gcl_wait[GCL_NEST];
+static unsigned g_gcl_depth;
+/* the awaited calls entered at or below `esp` did not return: they were
+ * unwound (a Lua error went through them) */
+static void gcl_unwound(uint32_t esp, int inclusive) {
+    while (g_gcl_depth && (g_gcl_wait[g_gcl_depth - 1u].esp < esp || (inclusive && g_gcl_wait[g_gcl_depth - 1u].esp == esp))) {
+        --g_gcl_depth;
+        if (++g_gcl_unreturned <= 5u)
+            isaac_log("[isaac][lua] class check: the lifted function called from 0x%08x did not return where the native way said yes (0x%08x); #%u",
+                      g_gcl_wait[g_gcl_depth].ret, g_gcl_wait[g_gcl_depth].expect, g_gcl_unreturned);
+    }
+}
+/* 1 and the userdata's guest address if the value at `index` is an object of
+ * the class of `key` (or of one derived from it) and may be handed out; 0
+ * for everything else. The stack is left as it came. */
+int isaac_lua_getclass_native(lua_State *L, int index, uint32_t key, int may_be_const, uint32_t *ud) {
+    if (index <= 0 || !isaac_is_guest_va(key)) return 0;
+    const int top0 = lua_gettop(L);
+    if (index > top0 || !lua_isuserdata(L, index) || !lua_checkstack(L, 6)) return 0;
+    lua_rawgetp(L, LUA_REGISTRYINDEX, isaac_g(key));
+    int ok = 0;
+    if (lua_istable(L, -1) && lua_getmetatable(L, index)) {
+        lua_rawgetp(L, -1, isaac_g(ISAAC_LB_CLASSFLAG_VA));
+        if (lua_type(L, -1) == LUA_TBOOLEAN) {
+            lua_pop(L, 1);
+            lua_pushstring(L, "__const");
+            lua_rawget(L, -2);
+            const int is_const = lua_type(L, -1) == LUA_TNIL;
+            lua_pop(L, 1);
+            if (is_const) {                          /* compared with the class's const table */
+                lua_pushstring(L, "__const");
+                lua_rawget(L, -3);
+                lua_replace(L, -3);
+            }
+            if (!is_const || may_be_const) {
+                for (unsigned depth = 0; depth < 64u; ++depth) {
+                    if (lua_rawequal(L, -1, -2)) { ok = 1; break; }
+                    if (!lua_istable(L, -1)) break;
+                    lua_pushstring(L, "__parent");
+                    lua_rawget(L, -2);
+                    if (lua_type(L, -1) == LUA_TNIL) break;
+                    lua_remove(L, -2);
+                }
+            }
+        }
+    }
+    lua_settop(L, top0);
+    if (!ok) return 0;
+    *ud = isaac_va(lua_touserdata(L, index));
+    return 1;
+}
+/* the selftest's look at the records while the check runs */
+static void (*g_gcl_probe)(void);
+void isaac_lua_getclass_set_probe(void (*fn)(void)) { g_gcl_probe = fn; }
+/* answered natively (mode 2: compared), left to the lifted function, answers that differed, lifted runs that did not return */
+void isaac_lua_getclass_counts(uint32_t out[4]) { out[0] = g_gcl_native; out[1] = g_gcl_guest; out[2] = g_gcl_mismatch; out[3] = g_gcl_unreturned; }
+/* The wrapper of 0x0085c590 (lift_patches.py) asks here first. 1 = answered:
+ * EAX and the ret are made. 0 = the lifted function runs. 2 = the lifted
+ * function runs and isaac_lua_getclass_verify is called after it (mode 2). */
+int isaac_lua_getclass(CpuState *restrict cpu) {
+    const int mode = lua_native_mode();
+    if (!mode) return 0;
+    if (mode == 2) gcl_unwound(cpu->ESP, 1);         /* a call awaited from this stack depth or deeper never came back */
+    uint32_t ud = 0;
+    const uint32_t key = isaac_r32(cpu->ESP + 4u);
+    const int may_be_const = (isaac_r32(cpu->ESP + 8u) & 0xffu) != 0u;       /* a byte: `cmp byte ptr [ebp+0xc], 0` */
+    /* This is guest code entering Lua without an import shim (1b above): a
+     * Lua call made here can step the collector, a finalizer is a guest
+     * function, and its frame is placed below the innermost recorded guest
+     * ESP. Without a record of this caller's ESP it landed on the frames
+     * between the last shim and here, and the caller went on with its
+     * arguments overwritten: verify mode on engine n11 showed the lifted run
+     * raising "(null) expected, got Entity" 32 times in 19,000,000 checks. */
+    volatile char anchor = 0;
+    lua_shim_enter((uintptr_t)&anchor, cpu->ESP);
+    if (g_gcl_probe) g_gcl_probe();
+    const int yes = isaac_is_guest_va(cpu->ECX) &&
+                    isaac_lua_getclass_native((lua_State *)isaac_g(cpu->ECX), (int)cpu->EDX, key, may_be_const, &ud);
+    lua_nest_prune((uintptr_t)&anchor);
+    if (!yes) {
+        ++g_gcl_guest;
+        return 0;
+    }
+    if (mode == 2) {
+        if (g_gcl_depth >= GCL_NEST) return 0;       /* deeper than is kept track of: not compared */
+        g_gcl_wait[g_gcl_depth].esp = cpu->ESP; g_gcl_wait[g_gcl_depth].expect = ud; g_gcl_wait[g_gcl_depth].ret = isaac_r32(cpu->ESP);
+        ++g_gcl_depth;
+        return 2;
+    }
+    ++g_gcl_native;
+    cpu->EAX = ud;
+    cpu->EIP = isaac_r32(cpu->ESP);
+    cpu->ESP += 4u;
+    return 1;
+}
+void isaac_lua_getclass_verify(const CpuState *cpu) {
+    const uint32_t entered = cpu->ESP - 4u;          /* the lifted function made its plain ret */
+    gcl_unwound(entered, 0);
+    if (!g_gcl_depth || g_gcl_wait[g_gcl_depth - 1u].esp != entered) return;   /* not one that was awaited */
+    const uint32_t expect = g_gcl_wait[--g_gcl_depth].expect;
+    ++g_gcl_native;
+    if (cpu->EAX != expect && ++g_gcl_mismatch <= 5u)
+        isaac_log("[isaac][lua] class check MISMATCH #%u: native 0x%08x, lifted 0x%08x", g_gcl_mismatch, expect, cpu->EAX);
+    if (g_gcl_native == 1000u || g_gcl_native == 100000u || g_gcl_native % 1000000u == 0u)
+        isaac_log("[isaac][lua] class check verify: %u answers compared, %u mismatch(es), %u lifted run(s) that did not return; "
+                  "%u left to the lifted function alone", g_gcl_native, g_gcl_mismatch, g_gcl_unreturned, g_gcl_guest);
+}
+
+/* ---- round 113: the game's collector steps, deferred between cycles ------
+ *
+ * Once per pass of its main loop the game steps the collector by n KB
+ * (0x008657c0: lua_gc(L, LUA_GCSTEP, n) at 0x008658b0, n = [engine+0x24]),
+ * and raises n, up to 10,000, whenever the heap grew over ten passes without
+ * shrinking in any. With a big mod that is always: with Fiend Folio n sat at
+ * 10,000 from the first seconds of a run (lab_gc.lua), a 91 MB heap was
+ * marked and swept about every 28 passes to free 7 MB, and the collector was
+ * 31% of the game's busy time.
+ *
+ * LUA_GCSTEP adds n KB to the collector's debt, so the game's steps also
+ * burn through the pause Lua leaves after a cycle. Here:
+ *  - between two cycles a step the game asks for is not made until the heap
+ *    has grown by pct percent of what it was when the last cycle ended
+ *    (ISAAC_GC_DEFAULT_PCT, or ISAAC_LUA_GC=<pct>; at most
+ *    ISAAC_GC_ROOM_CAP_KB of growth). Lua's own pause is set to 100 + pct,
+ *    so its allocation-driven steps begin the next cycle at about that point;
+ *  - from there the game's steps are made until the cycle ends, whoever ends
+ *    it (Lua's own steps at an allocation often do: host_lua_gcstate.c), but
+ *    each smaller than asked: a 128th of the heap plus three times what the
+ *    heap grew by since the last pass. The cycle's work is then spread over
+ *    a second or two of passes; made as asked, it came as a burst of slow
+ *    frames every few seconds;
+ *  - a step is made in slices of ISAAC_GC_SLICE_KB and stops when the pass
+ *    has spent ISAAC_GC_BUDGET_MS on it (ISAAC_LUA_GC_MS=<ms>): Lua counts a
+ *    swept object as a few bytes of work, so a step of a megabyte sweeps the
+ *    whole heap in one pass;
+ *  - a heap that has outgrown twice the allowance is stepped by as much as
+ *    the game asks, within four times that time.
+ * Nothing in the game's own state changes (it keeps counting and asking);
+ * what changes is how much garbage is waited for before the heap is walked,
+ * and so when a finalizer runs and how big the heap gets.
+ * ISAAC_LUA_GC=0 makes every step as asked and leaves Lua's pause alone.
+ *
+ * Round 117: the whole collection the game asks for at every room entry.
+ * The game calls lua_gc(L, LUA_GCCOLLECT, 0) and logs "Lua mem usage" at
+ * 0x007f769f (at every room entry: its log has that line after each
+ * "Room %d.%d(%s)" and "SpawnRNG seed") and at 0x0086ee91 (the Lua engine's
+ * start); no other call site passes LUA_GCCOLLECT. In the plain game the
+ * heap is under a MB and that is a millisecond. With Fiend Folio it marks
+ * and sweeps 90 to 110 MB in the frame the room appears in: about 110 ms of
+ * a 250 ms frame at every door (perf-rooms.mjs). So over
+ * ISAAC_GC_FULL_NOW_KB of heap the collection is not made in that call.
+ * ISAAC_LUA_GC_ROOM says what is done instead:
+ *   2 (the default) nothing: the collector keeps the pace described above,
+ *     and the garbage of the room left goes in the cycle the heap's growth
+ *     brings next;
+ *   1 a cycle is owed: the game's steps are made from the next pass on,
+ *     without the wait for growth, spread and time-boxed as above, until a
+ *     cycle has ended (one already running when the game asks counts; one
+ *     that ended unseen since the game's last step does not). Measured
+ *     against 2 on a walk with a door every two seconds: the same frames,
+ *     and a tenth more of the main thread busy, because a cycle is then
+ *     always running;
+ *   0 the collection is made in the call, as the game asks.
+ * What changes for a mod under 1 and 2: the garbage of the room just left
+ * is freed, and its finalizers run, seconds after the room appears and not
+ * before its first frame, and "Lua mem usage" reports the heap as it is.
+ * At or under the threshold the collection is always made as asked. */
+#define ISAAC_GC_DEFAULT_PCT 25
+#define ISAAC_GC_FULL_NOW_KB 4096
+#define ISAAC_GC_ROOM_CAP_KB (32 * 1024)
+#define ISAAC_GC_SPREAD      128
+#define ISAAC_GC_STEP_MIN_KB 64
+#define ISAAC_GC_SLICE_KB     16
+#define ISAAC_GC_BUDGET_MS    2.0
+extern int isaac_lua_gc_paused(lua_State *L);     /* host_lua_gcstate.c */
+#ifdef __EMSCRIPTEN__
+extern double emscripten_get_now(void);
+static double gc_now_ms(void) { return emscripten_get_now(); }
+#else
+#include <time.h>
+static double gc_now_ms(void) { return (double)clock() * 1000.0 / CLOCKS_PER_SEC; }
+#endif
+static double g_gc_budget_ms = ISAAC_GC_BUDGET_MS;
+static int g_gc_last_slices;
+/* the time one pass's steps may take, in ms (the selftest sets it out of the way) */
+void isaac_lua_gc_set_budget(double ms) { g_gc_budget_ms = ms; }
+int isaac_lua_gc_last_slices(void) { return g_gc_last_slices; }
+/* where the collector is, as the game's steps see it: GC_RUN a cycle is in
+ * progress (or nothing has been seen yet), GC_WAIT between cycles and the
+ * game's steps are not made, GC_PUSH between cycles and they are made again
+ * (the cycle has not begun) */
+enum { GC_RUN = 0, GC_WAIT = 1, GC_PUSH = 2 };
+static int g_gc_pct = -1, g_gc_phase = GC_RUN, g_gc_base_kb, g_gc_last_kb, g_gc_last_step, g_gc_pause_set;
+static uint32_t g_gc_asked, g_gc_deferred, g_gc_cycles;
+/* round 117: a whole collection the game asked for and has not had (see above) */
+static int g_gc_full_mode = -1, g_gc_owed;
+static uint32_t g_gc_full_asked, g_gc_full_paced;
+/* 1 = a whole collection asked for with this heap is spread over the passes to come */
+int isaac_lua_gc_full_paced(int count_kb, int pct, int mode) {
+    return pct > 0 && mode != 0 && count_kb > ISAAC_GC_FULL_NOW_KB;
+}
+void isaac_lua_gc_set_full(int mode) { g_gc_full_mode = mode; g_gc_owed = 0; g_gc_full_asked = g_gc_full_paced = 0u; }
+void isaac_lua_gc_full_counts(uint32_t out[3]) { out[0] = g_gc_full_asked; out[1] = g_gc_full_paced; out[2] = (uint32_t)g_gc_owed; }
+/* the growth waited for: pct percent of the heap at the last cycle end, capped */
+int isaac_lua_gc_room(int base_kb, int pct) {
+    int64_t room = (int64_t)base_kb * pct / 100;
+    if (room > ISAAC_GC_ROOM_CAP_KB) room = ISAAC_GC_ROOM_CAP_KB;
+    return (int)room;
+}
+/* 1 = the step is not made now */
+int isaac_lua_gc_defer(int count_kb, int base_kb, int in_cycle, int pct) {
+    if (pct <= 0 || in_cycle || base_kb <= 0) return 0;
+    return (int64_t)count_kb - base_kb < isaac_lua_gc_room(base_kb, pct);
+}
+/* the size of a step that is made: asked, the game's n; grew_kb, the heap's
+ * growth since the last pass */
+int isaac_lua_gc_step_kb(int asked, int count_kb, int base_kb, int grew_kb, int pct) {
+    if (pct <= 0 || base_kb <= 0) return asked;
+    if ((int64_t)count_kb - base_kb >= 2 * (int64_t)isaac_lua_gc_room(base_kb, pct)) return asked;
+    int64_t s = (int64_t)base_kb / ISAAC_GC_SPREAD + 3 * (int64_t)(grew_kb > 0 ? grew_kb : 0);
+    if (s < ISAAC_GC_STEP_MIN_KB) s = ISAAC_GC_STEP_MIN_KB;
+    return s < asked ? (int)s : asked;
+}
+void isaac_lua_gc_set_pct(int pct) {
+    g_gc_pct = pct; g_gc_phase = GC_RUN; g_gc_base_kb = g_gc_last_kb = g_gc_last_step = g_gc_pause_set = 0;
+    g_gc_asked = g_gc_deferred = g_gc_cycles = 0u;
+}
+void isaac_lua_gc_counts(uint32_t out[4]) { out[0] = g_gc_asked; out[1] = g_gc_deferred; out[2] = g_gc_cycles; out[3] = (uint32_t)g_gc_base_kb; }
+int isaac_lua_gc_last_step(void) { return g_gc_last_step; }
+static void gc_cycle_ended(lua_State *L) {
+    g_gc_phase = GC_WAIT; g_gc_base_kb = lua_gc(L, LUA_GCCOUNT, 0); ++g_gc_cycles;
+    g_gc_owed = 0;
+    if (g_gc_cycles <= 3u || g_gc_cycles % 200u == 0u)
+        isaac_log("[isaac][lua] collector: cycle %u ended at %d KB; %u step(s) asked, %u deferred",
+                  g_gc_cycles, g_gc_base_kb, g_gc_asked, g_gc_deferred);
+}
+int isaac_lua_gc(lua_State *L, int what, int data) {
+    if (g_gc_pct < 0) {
+        const char *e = getenv("ISAAC_LUA_GC");
+        int v = (e && *e) ? atoi(e) : ISAAC_GC_DEFAULT_PCT;
+        g_gc_pct = v < 0 ? 0 : v > 400 ? 400 : v;
+        const char *b = getenv("ISAAC_LUA_GC_MS");
+        if (b && *b) { double ms = atof(b); if (ms >= 0.1 && ms <= 1000.0) g_gc_budget_ms = ms; }
+        isaac_log(g_gc_pct ? "[isaac][lua] round 113: a collector step between cycles waits for %d%% of heap growth (ISAAC_LUA_GC)"
+                           : "[isaac][lua] round 113: every collector step is made as the game asks (ISAAC_LUA_GC=%d)", g_gc_pct);
+    }
+    if (!g_gc_pct) return lua_gc(L, what, data);
+    if (!g_gc_pause_set) { g_gc_pause_set = 1; lua_gc(L, LUA_GCSETPAUSE, 100 + g_gc_pct); }
+    if (what == LUA_GCCOLLECT) {
+        if (g_gc_full_mode < 0) {
+            const char *e = getenv("ISAAC_LUA_GC_ROOM");
+            g_gc_full_mode = (e && *e == '0') ? 0 : (e && *e == '1') ? 1 : 2;
+        }
+        ++g_gc_full_asked;
+        if (isaac_lua_gc_full_paced(lua_gc(L, LUA_GCCOUNT, 0), g_gc_pct, g_gc_full_mode)) {
+            if (!g_gc_full_paced++)
+                isaac_log(g_gc_full_mode == 2
+                          ? "[isaac][lua] round 117: a whole collection the game asks for over %d KB of heap is left to the "
+                            "collector's own pace (ISAAC_LUA_GC_ROOM=0 makes it at once, 1 owes a cycle)"
+                          : "[isaac][lua] round 117: a whole collection the game asks for over %d KB of heap is spread over "
+                            "the passes after it (ISAAC_LUA_GC_ROOM=0 makes it at once, 2 leaves it to the collector's pace)",
+                          ISAAC_GC_FULL_NOW_KB);
+            if (g_gc_full_mode == 2) return 0;
+            /* a cycle that ended since the game's last step is not the one owed */
+            if (g_gc_phase == GC_RUN && isaac_lua_gc_paused(L)) gc_cycle_ended(L);
+            g_gc_owed = 1;
+            return 0;
+        }
+    }
+    /* anything else (a count, a whole collection asked for outright) is made
+     * as asked; the next step sees for itself where the collector is */
+    if (what != LUA_GCSTEP || data <= 0) return lua_gc(L, what, data);
+    ++g_gc_asked;
+    /* what happened since the last step the game asked for: Lua's own steps
+     * (at an allocation, while a cycle runs) may have ended the cycle, and
+     * Lua or a mod may have begun one */
+    if (!isaac_lua_gc_paused(L)) g_gc_phase = GC_RUN;
+    else if (g_gc_phase == GC_RUN) gc_cycle_ended(L);
+    const int kb = lua_gc(L, LUA_GCCOUNT, 0);
+    const int grew = g_gc_last_kb ? kb - g_gc_last_kb : 0;
+    g_gc_last_kb = kb;
+    if (g_gc_phase == GC_WAIT) {
+        if (kb < g_gc_base_kb) g_gc_base_kb = kb;         /* a collection someone asked for outright shrank it */
+        if (!g_gc_owed && isaac_lua_gc_defer(kb, g_gc_base_kb, 0, g_gc_pct)) {
+            ++g_gc_deferred;
+            g_gc_last_step = 0;
+            return 0;
+        }
+        g_gc_phase = GC_PUSH;
+    }
+    g_gc_last_step = isaac_lua_gc_step_kb(data, kb, g_gc_base_kb, grew, g_gc_pct);
+    /* made in slices, and no further than the pass's time: Lua counts a
+     * swept object as a few bytes of work, so one step of a megabyte sweeps
+     * the whole heap -- 40 MB freed in one pass, 150 to 200 ms (lab_gc.lua) */
+    const int past = g_gc_last_step == data;              /* past twice the allowance (or the game asked for little) */
+    const double until = gc_now_ms() + (past ? 4.0 : 1.0) * g_gc_budget_ms;
+    int r = 0, left = g_gc_last_step;
+    g_gc_last_slices = 0;
+    while (left > 0) {
+        const int slice = left < ISAAC_GC_SLICE_KB ? left : ISAAC_GC_SLICE_KB;
+        r = lua_gc(L, LUA_GCSTEP, slice);
+        left -= slice; ++g_gc_last_slices;
+        if (r) break;                                     /* the cycle ended in this slice */
+        if (gc_now_ms() >= until) break;
+    }
+    if (!isaac_lua_gc_paused(L)) g_gc_phase = GC_RUN;
+    else if (g_gc_phase == GC_RUN || r) gc_cycle_ended(L);   /* it ended in this step (r: begun and ended in it) */
+    return r;
+}
+LUA_SHIM(lua_gc)      { cpu->EAX = (uint32_t)isaac_lua_gc(L_ARG(0), I_ARG(1), I_ARG(2)); }
 LUA_SHIM(lua_getinfo) { cpu->EAX = (uint32_t)lua_getinfo(L_ARG(0), S_ARG(1), (lua_Debug *)P_ARG(2)); }
 /* Register-held only (0x00930b63, the debug-hook path): the call-site census
  * saw 0 sites, so it had no binding and would have trapped. */
@@ -884,10 +1775,58 @@ LUA_SHIM(luaL_argerror) {
     const char *m = S_ARG(2);
     cpu->EAX = (uint32_t)luaL_argerror(L_ARG(0), I_ARG(1), m ? m : "bad argument");
 }
+/* round 103: a file name as Windows would take it. A mod's script names its
+ * other files in whatever case its author typed (Fiend Folio asks for
+ * resources/luarooms/thelab.lua; the file is TheLab.lua), which a PC's file
+ * system does not mind and the one these files sit in here does. The name is
+ * tried as given; failing that, each part of it is looked for in its directory
+ * without regard to case. */
+#include <dirent.h>
+#include <strings.h>
+#include <unistd.h>
+static const char *lua_file_any_case(const char *path, char *out, size_t cap) {
+    if (!path || access(path, F_OK) == 0) return path;
+    size_t n = 0;
+    const char *p = path;
+    out[0] = 0;
+    while (*p == '/') { if (n + 1 >= cap) return path; out[n++] = '/'; out[n] = 0; ++p; }
+    if (!n) return path;                      /* a relative name: not a mod's file */
+    while (*p) {
+        const char *e = strchr(p, '/');
+        size_t len = e ? (size_t)(e - p) : strlen(p);
+        if (len == 0) { p = e + 1; continue; }
+        if (n + len + 2 >= cap) return path;
+        DIR *d = opendir(out);
+        if (!d) return path;
+        int found = 0;
+        struct dirent *de;
+        while ((de = readdir(d)) != NULL) {
+            if (strlen(de->d_name) == len && strncasecmp(de->d_name, p, len) == 0) {
+                if (out[n - 1] != '/') out[n++] = '/';
+                memcpy(out + n, de->d_name, len); n += len; out[n] = 0;
+                found = 1;
+                break;
+            }
+        }
+        closedir(d);
+        if (!found) return path;
+        p += len;
+        while (*p == '/') ++p;
+    }
+    return out;
+}
 LUA_SHIM(luaL_loadfilex) {
-    cpu->EAX = (uint32_t)luaL_loadfilex(L_ARG(0), S_ARG(1), S_ARG(2));
+    /* round 102: this is the loader the game runs a mod's files with (three
+     * sites; the buffer loader below has one, the console's). The layer boots
+     * before the first of them that is a mod's. */
+    isaac_rgon_before_chunk(L_ARG(0), S_ARG(1));
+    char real[512];
+    cpu->EAX = (uint32_t)luaL_loadfilex(L_ARG(0), lua_file_any_case(S_ARG(1), real, sizeof real), S_ARG(2));
 }
 LUA_SHIM(luaL_loadbufferx) {
+    /* round 102: the REPENTOGON-compatible layer, if its mod is installed and
+     * on, runs once per state before the first mod's own chunk is loaded */
+    isaac_rgon_before_chunk(L_ARG(0), S_ARG(3));
     cpu->EAX = (uint32_t)luaL_loadbufferx(L_ARG(0), S_ARG(1),
                                           (size_t)isaac_arg(cpu, 2),
                                           S_ARG(3), S_ARG(4));
@@ -924,6 +1863,9 @@ LUAOPEN_SHIM(debug)
 void isaac_lua_report(void) {
     isaac_log("[isaac][lua] upstream 5.3.3 linked; %u/%d trampoline slots used "
               "for guest C functions", g_tramp_n, LUA_TRAMPOLINES);
+    if (g_gcl_native + g_gcl_guest)
+        isaac_log("[isaac][lua] luabridge class check (0x%08x): %u answered natively, %u left to the lifted function, %u mismatch(es)",
+                  ISAAC_LB_GETCLASS_VA, g_gcl_native, g_gcl_guest, g_gcl_mismatch);
 }
 
 #else   /* ------------------------------------------------------------------ */

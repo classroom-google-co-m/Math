@@ -43,10 +43,100 @@ void isaac_gl_draw_elements(unsigned mode, int count, unsigned type, uint32_t in
 #  if __has_include("lua.h")
 #    define ISAAC_SELFTEST_HAVE_LUA 1
 #    include "lua.h"
+#    include "lauxlib.h"
 #  endif
 #endif
 
 #ifdef ISAAC_SELFTEST_HAVE_LUA
+/* Round 111: a luabridge-shaped class for the native __index (host_lua.c). */
+static int selftest_ix_cf(lua_State *L) { (void)L; return 0; }
+static int selftest_ix_getter(lua_State *L) {
+    lua_pushvalue(L, 1);
+    lua_setglobal(L, "__ix_last");
+    lua_pushstring(L, "got");
+    return 1;
+}
+/* a getter that makes a new value userdata the way luabridge does: a pointer
+ * to its own storage first, then the value */
+static int selftest_ix_selfptr(lua_State *L) {
+    unsigned char *u = lua_newuserdata(L, 12);
+    uint32_t self = (uint32_t)(uintptr_t)(u + 4), v = 0x3f800000u;
+    memcpy(u, &self, 4); memcpy(u + 4, &v, 4); memcpy(u + 8, &v, 4);
+    return 1;
+}
+static int selftest_ix_newobj(lua_State *L) {
+    void *u = lua_newuserdata(L, 8);
+    memset(u, 0x5a, 8);
+    lua_pushvalue(L, 1);
+    lua_setmetatable(L, -2);
+    return 1;
+}
+/* Round 114 (native __gc): an object with a vtable word, and the stand-in for the lifted __gc */
+static unsigned g_gcn_calls;
+static uint32_t g_gcn_va, g_gcn_store;
+static int g_gcn_top;
+static int selftest_gcn_new(lua_State *L) {            /* (metatable, vtable) -> a 16-byte object */
+    uint32_t vt = (uint32_t)lua_tointeger(L, 2);
+    unsigned char *u = lua_newuserdata(L, 16);
+    memset(u, 0x5a, 16);
+    memcpy(u, &vt, 4);
+    lua_pushvalue(L, 1);
+    lua_setmetatable(L, -2);
+    return 1;
+}
+/* the same through the game's lua_setmetatable (host_lua.c 1e) */
+extern int isaac_lua_setmetatable(lua_State *L, int idx);
+static int selftest_gcn_newgame(lua_State *L) {
+    uint32_t vt = (uint32_t)lua_tointeger(L, 2);
+    unsigned char *u = lua_newuserdata(L, 16);
+    memset(u, 0x5a, 16);
+    memcpy(u, &vt, 4);
+    lua_pushvalue(L, 1);
+    isaac_lua_setmetatable(L, -2);
+    return 1;
+}
+static int selftest_gcn_vt(lua_State *L) {
+    uint32_t vt;
+    memcpy(&vt, lua_touserdata(L, 1), 4);
+    lua_pushinteger(L, (lua_Integer)vt);
+    return 1;
+}
+static int selftest_gcn_guest(lua_State *L, uint32_t va, unsigned slot) {
+    (void)slot;
+    ++g_gcn_calls; g_gcn_va = va; g_gcn_top = lua_gettop(L);
+    if (g_gcn_store && lua_type(L, 1) == LUA_TUSERDATA) memcpy(lua_touserdata(L, 1), &g_gcn_store, 4);
+    return 0;
+}
+static unsigned g_ix_lifted;
+static int g_ix_top, g_ix_ref_wrong;
+/* the stand-in for the lifted function on the ways the native one leaves */
+static int selftest_ix_lifted(lua_State *L, uint32_t va, unsigned slot) {
+    (void)slot;
+    ++g_ix_lifted;
+    g_ix_top = lua_gettop(L);
+    lua_pushstring(L, va == 0x0085cd40u ? "LIFTED" : "WRONG VA");
+    return 1;
+}
+/* the lifted function's answer for verify mode, by a lookup written in Lua
+ * (absolute indices only: verify calls it with the native find above [2]) */
+static int selftest_ix_reference(lua_State *L, uint32_t va, unsigned slot) {
+    (void)va; (void)slot;
+    if (g_ix_ref_wrong) { lua_pushstring(L, "wrong"); return 1; }
+    if (luaL_dostring(L,
+            "__ix_ref = __ix_ref or function(o, k)\n"
+            "  local c = getmetatable(o)\n"
+            "  while true do\n"
+            "    local v = rawget(c, k) if v ~= nil then return v end\n"
+            "    local pg = rawget(c, '__propget') local g = pg and rawget(pg, k) if g then return g(o) end\n"
+            "    c = rawget(c, '__parent') if c == nil then return nil end\n"
+            "  end\n"
+            "end") != LUA_OK) { lua_pushnil(L); return 1; }
+    lua_getglobal(L, "__ix_ref");
+    lua_pushvalue(L, 1);
+    lua_pushvalue(L, 2);
+    lua_call(L, 2, 1);
+    return 1;
+}
 /* luaL_error raises, so it is called from inside a protected call: a C
  * function that sets up the guest frame the game's require would, and calls
  * the shim. The upvalues are the guest addresses of the format and its two
@@ -63,6 +153,52 @@ static int selftest_raise_through_shim(lua_State *L) {
     isaac_w32(c.ESP + 16, (uint32_t)lua_tointegerx(L, lua_upvalueindex(3), NULL));
     imp_lua5_3_3r__luaL_error(&c);
     return 0;
+}
+
+/* Round 100: guest C functions that re-enter Lua, reached through the
+ * trampolines. NEST fills its frame with its own marker and calls itself once
+ * through lua_getglobal + lua_callk, the way the game's include runs a file
+ * that calls include; RAISE raises through luaL_error. Both keep
+ * g_guest_call_esp the way the real isaac_guest_call does. */
+#define SELFTEST_LUA_NEST  0xDEAD0010u
+#define SELFTEST_LUA_RAISE 0xDEAD0011u
+void imp_lua5_3_3r__lua_getglobal(CpuState *restrict cpu);
+void imp_lua5_3_3r__lua_callk(CpuState *restrict cpu);
+uint32_t isaac_lua_nest_probe(unsigned *shims, unsigned *calls);
+extern uint32_t g_guest_call_esp;
+static uint32_t g_nest_name, g_nest_esp[4], g_raise_fmt, g_raise_esp[8];
+static unsigned g_nest_calls, g_raise_calls;
+static int g_nest_frame_intact = -1;
+static void selftest_lua_guest(uint32_t va, CpuState *cpu) {
+    const uint32_t L = isaac_r32(cpu->ESP + 4);
+    CpuState c;
+    memset(&c, 0, sizeof c);
+    if (va == SELFTEST_LUA_RAISE) {
+        if (g_raise_calls < 8) g_raise_esp[g_raise_calls] = cpu->ESP;
+        ++g_raise_calls;
+        c.ESP = cpu->ESP - 0x100u;
+        isaac_w32(c.ESP, 0xDEADBEEF);
+        isaac_w32(c.ESP + 4, L);
+        isaac_w32(c.ESP + 8, g_raise_fmt);
+        imp_lua5_3_3r__luaL_error(&c);             /* raises: does not return */
+        return;
+    }
+    const unsigned me = g_nest_calls++;
+    if (me < 4) g_nest_esp[me] = cpu->ESP;
+    for (uint32_t a = cpu->ESP - 0x80u; a < cpu->ESP; a += 4) isaac_w32(a, 0xC0DE0000u | me);
+    if (me == 0) {
+        c.ESP = cpu->ESP - 0xC0u;                  /* below its locals */
+        isaac_w32(c.ESP, 0xDEADBEEF);
+        isaac_w32(c.ESP + 4, L);
+        isaac_w32(c.ESP + 8, g_nest_name);
+        imp_lua5_3_3r__lua_getglobal(&c);
+        for (unsigned k = 2; k <= 5; ++k) isaac_w32(c.ESP + 4u * k, 0);   /* nargs nresults ctx k */
+        imp_lua5_3_3r__lua_callk(&c);
+        g_nest_frame_intact = 1;
+        for (uint32_t a = cpu->ESP - 0x80u; a < cpu->ESP; a += 4)
+            if (isaac_r32(a) != 0xC0DE0000u) g_nest_frame_intact = 0;
+    }
+    cpu->EAX = 0;
 }
 #endif
 
@@ -91,6 +227,15 @@ static unsigned g_vcalls;
 void isaac_guest_call(uint32_t va, CpuState *restrict cpu) {
     ++g_vcalls;
     if (!cpu) return;
+#ifdef ISAAC_SELFTEST_HAVE_LUA
+    if (va == SELFTEST_LUA_NEST || va == SELFTEST_LUA_RAISE) {
+        const uint32_t esp_saved = g_guest_call_esp;
+        g_guest_call_esp = cpu->ESP;
+        selftest_lua_guest(va, cpu);
+        g_guest_call_esp = esp_saved;
+        return;
+    }
+#endif
     if (va == SELFTEST_VCALL_EOF) { cpu->EAX = 0xFFFFFFFFu; return; }
     cpu->EAX = 0;
 }
@@ -133,6 +278,13 @@ double isaac_render_gate_wait_ms(void);
 double isaac_render_gate_carry_ms(void);
 double isaac_render_gate_pace_ms(double now_ms);
 uint32_t isaac_render_gate_intervals(int cls, double *mean_ms, double *max_ms);
+/* Round 111: an in-between pass that holds a new press is drawn */
+int isaac_render_gate_decide_input(double now_ms, int have_game, uint32_t game_ticks, int input_edge);
+uint32_t isaac_render_gate_kept(void);
+uint32_t isaac_render_gate_drawn(void);
+int isaac_input_keyboard_edge(const uint8_t *cur, const uint8_t *prev, uint32_t n);
+int isaac_input_pad_edge(const uint32_t w[8]);
+int isaac_input_edge_now(void);
 /* Round 95: the C++ catch the host carries out (host_shims_eh.c), on tables
  * laid out the way MSVC lays them out, in a scratch corner of the guest. */
 static void eh_str(uint32_t va, const char *s) { for (; *s; ++s, ++va) *(uint8_t *)isaac_g(va) = (uint8_t)*s; *(uint8_t *)isaac_g(va) = 0; }
@@ -239,7 +391,79 @@ static void test_eh(void) {
     check(isaac_eh_tail(0x008659f9u, &c) == 1 && c.EAX == 0x7777u && c.EBX == 0xEB0Bu && c.EIP == 0x00FEDCBAu
           && c.ESP == outer + 8u + 8u && c.EBP == 0x0BADBEEFu && c.ESI == 0xE5u,
           "eh: GetTrinket's aligned frame returns its local through mov esp,ebx");
-    check(isaac_eh_tail(0x00865602u, &c) == 0, "eh: GetShaderParams' continuation is not translated");
+    /* PreEntitySpawn (0x00864abc), the tail a mod's error in MC_PRE_ENTITY_SPAWN takes
+     * (angels-drop-items in every Secret Exit room): mov ebx,[ebp-0x14]; fs:[0] from
+     * [ebp-0xc]; pop ecx/edi/esi; mov esp,ebp; pop ebp; mov esp,ebx; pop ebx; ret 0x1c.
+     * The function returns nothing (its results go out through pointers): EAX stays. */
+    isaac_w32(G - 0xcu, 0x0FEDC0C0u);
+    { const uint32_t v[] = {0xEC, 0xED, 0xE5}; eh_w(G - 0x40u, v, 3); }
+    c.EBP = G; c.ESP = G - 0x40u; c.EAX = 0x00864abcu; c.EBX = 0u;
+    check(isaac_eh_tail(0x00864abcu, &c) == 1 && c.EAX == 0x00864abcu && c.EBX == 0xEB0Bu && c.EIP == 0x00FEDCBAu
+          && c.ESP == outer + 8u + 0x1cu && c.EBP == 0x0BADBEEFu && c.ESI == 0xE5u && c.EDI == 0xEDu && c.ECX == 0xECu
+          && isaac_r32(ISAAC_TEB_VA) == 0x0FEDC0C0u,
+          "eh: PreEntitySpawn's aligned frame restores fs:[0] and its registers and returns with ret 0x1c");
+    /* Round 101: GetShaderParams. The arm a thrown callback takes (no table
+     * referenced yet: [ebp-0x20] still -1) writes {L, LUA_NOREF} through the
+     * result pointer at [ebp+8], returns it and pops 8; the arm with a
+     * reference runs calls and stays untranslated. */
+    {
+        const uint32_t out = S + 0x2400u, L0 = 0x00123450u;
+        isaac_w32(F + 8u, out); isaac_w32(out, 0xAAAAAAAAu); isaac_w32(out + 4u, 0xBBBBBBBBu);
+        isaac_w32(F - 0x24u, L0);
+        isaac_w32(F - 0x20u, 7u);                                    /* a reference was taken */
+        c.EBP = F; c.ESP = sp; c.EAX = 0x00865602u;
+        check(isaac_eh_tail(0x00865602u, &c) == 0 && isaac_r32(out) == 0xAAAAAAAAu && c.ESP == sp,
+              "eh: GetShaderParams with a table already referenced is left alone, untouched");
+        isaac_w32(F - 0x20u, 0xFFFFFFFFu);
+        c.EBP = F; c.ESP = sp; c.EAX = 0x00865602u;
+        check(isaac_eh_tail(0x00865602u, &c) == 1 && c.EAX == out && isaac_r32(out) == L0 && isaac_r32(out + 4u) == 0xFFFFFFFFu,
+              "eh: GetShaderParams after a thrown callback answers {L, LUA_NOREF} through its result pointer");
+        check(c.EIP == 0x00ABCDEFu && c.ESP == F + 8u + 8u && c.EBX == 0xEBu && c.ESI == 0xE5u && c.EDI == 0xEDu && c.EBP == 0x0BADF00Du,
+              "eh: and returns through its own epilogue, ret 8");
+    }
+}
+
+/* Round 124 (issue 18): the ending videos' frames are GL_RGB rows written into
+ * a GL_RGBA texture, which WebGL2 refuses; the web glTexSubImage2D widens them.
+ * What it decides from: the level-0 internal format per texture name (exact,
+ * forgotten on delete), the one mismatch it widens, and the widening itself
+ * (source rows padded to the unpack alignment, alpha 0xff). */
+uint32_t isaac_glc_tex_ifmt(uint32_t name);
+int isaac_gl_sub_rgb_into_rgba(uint32_t ifmt, uint32_t format, uint32_t type);
+size_t isaac_gl_rgb_rows_to_rgba(const uint8_t *src, uint32_t w, uint32_t rows, uint32_t align, uint8_t *dst);
+static void test_gl_rgb_widen(void) {
+    isaac_glc_reset();
+    isaac_glc_tex_active(0x84C0u);
+    isaac_glc_tex_bind(0x0DE1u, 9); isaac_glc_tex_image(0x0DE1u); isaac_glc_tex_shape(0x0DE1u, 0, 0x1908u, 1024, 1024);
+    isaac_glc_tex_bind(0x0DE1u, 4105); isaac_glc_tex_image(0x0DE1u); isaac_glc_tex_shape(0x0DE1u, 0, 0x1907u, 64, 64);   /* 9 + 4096: the shape table's same slot */
+    isaac_glc_tex_bind(0x0DE1u, 9); isaac_glc_tex_image(0x0DE1u); isaac_glc_tex_shape(0x0DE1u, 1, 0x1907u, 512, 512);   /* level 1 says nothing about level 0 */
+    check(isaac_glc_tex_ifmt(9) == 0x1908u && isaac_glc_tex_ifmt(4105) == 0x1907u,
+          "rgb widen: each texture's level-0 internal format is kept by name, a colliding name included");
+    check(isaac_glc_tex_ifmt(10) == 0u && isaac_glc_tex_ifmt(0) == 0u && isaac_glc_tex_ifmt(0x7fffffffu) == 0u,
+          "rgb widen: a name never given an image is not known");
+    isaac_glc_tex_delete(9);
+    check(isaac_glc_tex_ifmt(9) == 0u && isaac_glc_tex_ifmt(4105) == 0x1907u, "rgb widen: a deleted texture is forgotten, the other kept");
+    check(isaac_gl_sub_rgb_into_rgba(0x1908u, 0x1907u, 0x1401u) && isaac_gl_sub_rgb_into_rgba(0x8058u, 0x1907u, 0x1401u),
+          "rgb widen: GL_RGB / UNSIGNED_BYTE rows into an RGBA or RGBA8 texture are widened (the video frame upload)");
+    check(!isaac_gl_sub_rgb_into_rgba(0x1908u, 0x1908u, 0x1401u) && !isaac_gl_sub_rgb_into_rgba(0x1907u, 0x1907u, 0x1401u)
+          && !isaac_gl_sub_rgb_into_rgba(0u, 0x1907u, 0x1401u) && !isaac_gl_sub_rgb_into_rgba(0x1908u, 0x1907u, 0x1406u)
+          && !isaac_gl_sub_rgb_into_rgba(0x1908u, 0x11907u, 0x1401u),
+          "rgb widen: matching formats, an unknown texture, another type or a wide format word are forwarded as they are");
+    {
+        /* 3x2 RGB, rows of 9 bytes padded to 12 at alignment 4; the pad bytes must not leak */
+        const uint8_t src[24] = { 1, 2, 3, 4, 5, 6, 7, 8, 9, 0xee, 0xee, 0xee,  10, 11, 12, 13, 14, 15, 16, 17, 18, 0xee, 0xee, 0xee };
+        uint8_t dst[26];
+        memset(dst, 0x55, sizeof dst);
+        size_t n = isaac_gl_rgb_rows_to_rgba(src, 3, 2, 4, dst);
+        const uint8_t want[24] = { 1, 2, 3, 255, 4, 5, 6, 255, 7, 8, 9, 255,  10, 11, 12, 255, 13, 14, 15, 255, 16, 17, 18, 255 };
+        check(n == 24u && !memcmp(dst, want, 24) && dst[24] == 0x55 && dst[25] == 0x55,
+              "rgb widen: RGB rows padded to the unpack alignment come out as packed RGBA with alpha 255, nothing written past");
+        uint8_t two[16];
+        n = isaac_gl_rgb_rows_to_rgba(src, 2, 2, 1, two);   /* alignment 1: rows of 6 bytes back to back */
+        check(n == 16u && two[0] == 1 && two[4] == 4 && two[7] == 255 && two[8] == 7 && two[9] == 8 && two[10] == 9 && two[12] == 0xee,
+              "rgb widen: at alignment 1 the second row starts at byte 6");
+    }
+    isaac_glc_reset();
 }
 
 /* Round 94: a sliced job asleep until wake_ms sits out a frame at now_ms. */
@@ -294,6 +518,25 @@ static void test_lazy_textures(void) {
           "lazy textures: the sprite comes back exactly (whole pixels)");
     check(isaac_lazy_encode(noise, N, 0, code) == ln && isaac_lazy_decode(code, ln, 0, back, N) && !memcmp(back, noise, N * 4),
           "lazy textures: noise comes back exactly too (literal runs)");
+    {   /* round 117: coded in one pass into a buffer of a given size */
+        extern size_t isaac_lazy_encode_cap(const uint8_t *px, uint32_t npix, int gray, uint8_t *out, size_t cap);
+        uint8_t *one = (uint8_t *)malloc(N * 8);
+        memset(one, 0xA5, N * 8);
+        check(isaac_lazy_encode_cap(sprite, N, 0, one, ls + 8) == ls && isaac_lazy_encode(sprite, N, 0, code) == ls && !memcmp(one, code, ls)
+              && one[ls] == 0xA5,
+              "lazy textures: coded into a buffer with room, the code is the same bytes and nothing more is written");
+        memset(one, 0xA5, N * 8);
+        int over = isaac_lazy_encode_cap(sprite, N, 0, one, ls - 1) == (size_t)-1, clean = 1;
+        for (size_t k = ls - 1; k < ls + 64; ++k) if (one[k] != 0xA5) clean = 0;
+        check(over && clean, "lazy textures: a buffer one byte short is refused, and nothing is written past it");
+        memset(one, 0xA5, N * 8);
+        over = isaac_lazy_encode_cap(noise, N, 0, one, (size_t)N * 2) == (size_t)-1; clean = 1;
+        for (size_t k = (size_t)N * 2; k < (size_t)N * 2 + 64; ++k) if (one[k] != 0xA5) clean = 0;
+        check(over && clean, "lazy textures: noise into half its RGBA is refused the same way");
+        check(isaac_lazy_encode_cap(glyph, N, 1, one, lg + 8) == lg && isaac_lazy_decode(one, lg, 1, back, N) && !memcmp(back, glyph, N * 4),
+              "lazy textures: and a gray page coded in one pass comes back exactly");
+        free(one);
+    }
     {   /* runs at both ends, of every length around the repeat threshold */
         uint8_t edge[64 * 4];
         for (int i = 0; i < 64; ++i) { uint8_t v = (uint8_t)(i < 3 ? 9 : i < 5 ? 1 : i < 13 ? 2 : i < 20 ? i : 200); memset(edge + i * 4, v, 4); }
@@ -321,6 +564,18 @@ static void test_lazy_textures(void) {
     check(pending == 1 && held == lg && raw == (uint64_t)N * 4, "lazy textures: its code is what is held");
     check(!isaac_lazy_tex_defer(9, 0x0DE1, 0, 0x1908, W, H, 0, 0x1908, 0x1401, noise), "lazy textures: noise is uploaded at once");
     check(!isaac_lazy_tex_defer(10, 0x0DE1, 0, 0x1908, 64, 64, 0, 0x1908, 0x1401, glyph), "lazy textures: under 64 KB too");
+    {   /* round 117: five eighths noise codes to more than half and less than the whole RGBA */
+        uint8_t *mixed = (uint8_t *)calloc(N, 4);
+        memcpy(mixed, noise, (size_t)N * 4 * 5 / 8);
+        size_t lm = isaac_lazy_encode(mixed, N, 0, NULL);
+        uint32_t ref0 = 0, ref1 = 0;
+        isaac_lazy_tex_stats(NULL, NULL, NULL, &ref0, NULL, NULL);
+        int kept = isaac_lazy_tex_defer(21, 0x0DE1, 0, 0x1908, W, H, 0, 0x1908, 0x1401, mixed);
+        isaac_lazy_tex_stats(NULL, NULL, NULL, &ref1, NULL, NULL);
+        check(lm > (size_t)N * 2 && lm < (size_t)N * 4 && !kept && ref1 == ref0 + 1u && !isaac_lazy_tex_pending(21),
+              "lazy textures: a code between half and the whole RGBA is uploaded at once");
+        free(mixed);
+    }
     check(!isaac_lazy_tex_defer(11, 0x0DE1, 1, 0x1908, W, H, 0, 0x1908, 0x1401, glyph) &&
           !isaac_lazy_tex_defer(11, 0x0DE1, 0, 0x1907, W, H, 0, 0x1907, 0x1401, glyph) &&
           !isaac_lazy_tex_defer(0, 0x0DE1, 0, 0x1908, W, H, 0, 0x1908, 0x1401, glyph) &&
@@ -420,6 +675,117 @@ static void test_lazy_textures(void) {
               "lazy textures: a texture within the 4 MB band is one whole upload");
     }
     free(glyph); free(sprite); free(noise); free(back); free(code); free(g_up_px); g_up_px = NULL;
+}
+/* Round 118: an image the game's loader returned is kept past its last user
+ * (host_img_keep.c). The table is driven here with stand-ins for the two
+ * guest calls: a reference taken into a slot, a slot let go. */
+static uint32_t g_ik_held[256], g_ik_holds, g_ik_drops, g_ik_last_drop, g_ik_next;
+static int g_ik_refuse, g_ik_inside;
+static double g_ik_now;
+static void ik_drop(void *ctx, uint32_t i);
+static int ik_hold(void *ctx, uint32_t i) {
+    (void)ctx;
+    if (g_ik_refuse) return 0;
+    g_ik_held[i] = g_ik_next; ++g_ik_holds;
+    return 1;
+}
+static void ik_drop(void *ctx, uint32_t i) {
+    g_ik_last_drop = g_ik_held[i]; g_ik_held[i] = 0u; ++g_ik_drops;
+    /* a load made from inside the game's destructor: the slot being let go is left alone */
+    if (g_ik_inside) { g_ik_inside = 0; g_ik_next = 0x9000u; isaac_img_keep_note(0x9000u, 200u, g_ik_now, ik_hold, ik_drop, ctx); g_ik_next = 0xd00u; }
+}
+static int ik_note(uint32_t img, uint64_t bytes) { g_ik_next = img; return isaac_img_keep_note(img, bytes, g_ik_now, ik_hold, ik_drop, NULL); }
+static int ik_holds(uint32_t img) { for (int i = 0; i < 256; ++i) if (g_ik_held[i] == img) return 1; return 0; }
+/* Round 121: what the nesting records say while the native class check runs */
+static uint32_t g_gcl_probe_esp;
+static unsigned g_gcl_probe_shims;
+static void selftest_gcl_probe(void) {
+    extern uint32_t isaac_lua_nest_probe(unsigned *shims, unsigned *calls);
+    g_gcl_probe_esp = isaac_lua_nest_probe(&g_gcl_probe_shims, NULL);
+}
+static void test_img_keep(void) {
+    uint32_t c[6]; uint64_t bytes;
+    memset(g_ik_held, 0, sizeof g_ik_held); g_ik_holds = g_ik_drops = g_ik_last_drop = 0u; g_ik_refuse = g_ik_inside = 0;
+    isaac_img_keep_reset(1000u, 0.0);
+    check(ik_note(0x100u, 400u) == 1 && ik_note(0x200u, 400u) == 1 && ik_holds(0x100u) && ik_holds(0x200u) && g_ik_holds == 2u,
+          "image keep: an image the loader returns is taken, once each");
+    isaac_img_keep_counts(c, &bytes);
+    check(c[0] == 2u && c[1] == 2u && c[2] == 0u && c[3] == 0u && bytes == 800u, "image keep: what is held is counted in images and bytes");
+    check(ik_note(0x100u, 0u) == 0 && ik_note(0x100u, 999999u) == 0 && g_ik_holds == 2u && (isaac_img_keep_counts(c, &bytes), c[2] == 2u && bytes == 800u),
+          "image keep: an image held already is not taken again, whatever size comes with it");
+    /* 0x100 was asked for last: 0x200 is the one to go */
+    check(ik_note(0x300u, 300u) == 1 && g_ik_drops == 1u && g_ik_last_drop == 0x200u && ik_holds(0x100u) && ik_holds(0x300u) && !ik_holds(0x200u),
+          "image keep: past the budget the least recently asked-for image is let go, not the oldest taken");
+    isaac_img_keep_counts(c, &bytes);
+    check(c[0] == 2u && c[3] == 1u && bytes == 700u, "image keep: and its bytes are no longer counted");
+    check(ik_note(0x400u, 300u) == 1 && g_ik_drops == 1u && (isaac_img_keep_counts(c, &bytes), bytes == 1000u),
+          "image keep: an image that fits exactly lets nothing go");
+    check(ik_note(0x500u, 1000u) == 1 && g_ik_drops == 4u && ik_holds(0x500u) && (isaac_img_keep_counts(c, &bytes), c[0] == 1u && bytes == 1000u),
+          "image keep: an image of the whole budget lets everything else go");
+    check(ik_note(0x600u, 1001u) == 0 && g_ik_drops == 4u && ik_holds(0x500u) && !ik_holds(0x600u) && (isaac_img_keep_counts(c, &bytes), c[4] == 1u),
+          "image keep: an image larger than the budget is not taken and lets nothing go");
+    check(ik_note(0u, 10u) == 0 && g_ik_holds == 5u, "image keep: no image is nothing");
+    /* a size not known counts as 256 KB */
+    isaac_img_keep_reset(600u * 1024u, 0.0);
+    memset(g_ik_held, 0, sizeof g_ik_held); g_ik_holds = g_ik_drops = 0u;
+    check(ik_note(0x700u, 0u) == 1 && ik_note(0x800u, 0u) == 1 && (isaac_img_keep_counts(c, &bytes), bytes == 2u * 256u * 1024u)
+          && ik_note(0x900u, 0u) == 1 && g_ik_drops == 1u && !ik_holds(0x700u),
+          "image keep: an image of unknown size counts as 256 KB");
+    /* a reference that could not be taken leaves the table as it was */
+    isaac_img_keep_reset(1000u, 0.0);
+    memset(g_ik_held, 0, sizeof g_ik_held); g_ik_holds = g_ik_drops = 0u;
+    g_ik_refuse = 1;
+    check(ik_note(0xa00u, 100u) == 0 && (isaac_img_keep_counts(c, &bytes), c[0] == 0u && c[1] == 0u && bytes == 0u),
+          "image keep: a reference that is not taken is not counted");
+    g_ik_refuse = 0;
+    check(ik_note(0xa00u, 100u) == 1 && (isaac_img_keep_counts(c, &bytes), c[0] == 1u && bytes == 100u), "image keep: and the image can be taken later");
+    /* no more slots than 256: the 257th lets the first go */
+    isaac_img_keep_reset(1u << 30, 0.0);
+    memset(g_ik_held, 0, sizeof g_ik_held); g_ik_holds = g_ik_drops = 0u;
+    int all = 1;
+    for (uint32_t k = 1; k <= 256u; ++k) all &= ik_note(0x1000u + k, 10u);
+    check(all && g_ik_drops == 0u && ik_note(0x5000u, 10u) == 1 && g_ik_drops == 1u && g_ik_last_drop == 0x1001u && (isaac_img_keep_counts(c, &bytes), c[0] == 256u),
+          "image keep: 256 images at most; the next lets the least recent go");
+    /* a load made while a slot is being let go (the game's destructor loads
+     * another image, of 200 bytes, which itself needs room): the slot being
+     * let go is neither handed out nor let go a second time. 0xb00 goes for
+     * 0xd00; inside that, 0xc00 goes for 0x9000; then 0x9000 goes for 0xd00. */
+    isaac_img_keep_reset(250u, 0.0);
+    memset(g_ik_held, 0, sizeof g_ik_held); g_ik_holds = g_ik_drops = 0u;
+    ik_note(0xb00u, 100u); ik_note(0xc00u, 100u);
+    g_ik_inside = 1;
+    int took = ik_note(0xd00u, 100u);
+    isaac_img_keep_counts(c, &bytes);
+    check(took == 1 && ik_holds(0xd00u) && !ik_holds(0x9000u) && !ik_holds(0xb00u) && !ik_holds(0xc00u) && g_ik_drops == 3u && g_ik_holds == 4u
+          && c[0] == 1u && c[1] == 4u && c[3] == 3u && bytes == 100u,
+          "image keep: a load made from inside a let-go leaves that slot alone, and the books still balance");
+    isaac_img_keep_reset(0u, 0.0);
+    check(ik_note(0xe00u, 10u) == 0 && (isaac_img_keep_counts(c, &bytes), c[0] == 0u), "image keep: with no budget nothing is taken");
+    /* an image nobody asked for within the idle time is let go at the next load */
+    isaac_img_keep_reset(1000u, 5000.0);
+    memset(g_ik_held, 0, sizeof g_ik_held); g_ik_holds = g_ik_drops = 0u;
+    g_ik_now = 1000.0; ik_note(0xf10u, 100u); ik_note(0xf20u, 100u);
+    g_ik_now = 4000.0; ik_note(0xf10u, 0u);                       /* asked for again at 4 s */
+    g_ik_now = 6000.0;
+    check(ik_note(0xf30u, 100u) == 1 && g_ik_drops == 0u && ik_holds(0xf20u),
+          "image keep: an image asked for exactly the idle time ago is still held");
+    g_ik_now = 6001.0;
+    check(ik_note(0xf40u, 100u) == 1 && g_ik_drops == 1u && g_ik_last_drop == 0xf20u && ik_holds(0xf10u) && ik_holds(0xf30u)
+          && (isaac_img_keep_counts(c, &bytes), c[0] == 3u && c[3] == 0u && c[5] == 1u && bytes == 300u),
+          "image keep: past the idle time it is let go, and one asked for again since is not");
+    g_ik_now = 9500.0;
+    check(ik_note(0xf10u, 0u) == 0 && g_ik_drops == 1u && ik_holds(0xf10u) && (isaac_img_keep_counts(c, &bytes), c[0] == 3u),
+          "image keep: an image asked for after its idle time, and still held, is the most recent again and stays");
+    g_ik_now = 14400.0;
+    check(ik_note(0xf10u, 0u) == 0 && g_ik_drops == 3u && ik_holds(0xf10u) && !ik_holds(0xf30u) && !ik_holds(0xf40u)
+          && (isaac_img_keep_counts(c, &bytes), c[0] == 1u && c[5] == 3u && bytes == 100u),
+          "image keep: a load of a held image lets the idle others go too");
+    isaac_img_keep_reset(1000u, 0.0);
+    memset(g_ik_held, 0, sizeof g_ik_held); g_ik_holds = g_ik_drops = 0u;
+    g_ik_now = 0.0; ik_note(0xf50u, 100u);
+    g_ik_now = 1e12;
+    check(ik_note(0xf60u, 100u) == 1 && g_ik_drops == 0u && ik_holds(0xf50u), "image keep: with no idle time nothing is let go for being idle");
+    g_ik_now = 0.0;
 }
 /* Round 98: a sound sample's PCM is read when it is first played (host_snd_lazy.c).
  * The guest call that fills is replaced: the table, the fill's choice of buffers,
@@ -636,6 +1002,113 @@ static void test_render_gate(void) {
     check(isaac_yield_work_ms(120.0, 0.0, 9.0) == 1e9, "yield: before any present resumed, a pass reads as long");
 }
 
+/* Round 111: the render gate draws an in-between pass that holds a newly
+ * triggered key or pad button (host_shims_win.c isaac_input_edge_now). */
+static void test_input_edges(void) {
+    uint8_t cur[0x15d], prev[0x15d];
+    memset(cur, 0, sizeof cur); memset(prev, 0, sizeof prev);
+    check(!isaac_input_keyboard_edge(cur, prev, 0x15d), "input edge: no key down, no edge");
+    cur[5] = 1; prev[5] = 1;
+    check(!isaac_input_keyboard_edge(cur, prev, 0x15d), "input edge: a key held since the last update is no edge");
+    cur[5] = 0;
+    check(!isaac_input_keyboard_edge(cur, prev, 0x15d), "input edge: a key released is no edge");
+    cur[0x15c] = 1;
+    check(isaac_input_keyboard_edge(cur, prev, 0x15d), "input edge: the last key (0x15c) down now and not before is one");
+    cur[0x15c] = 0; cur[0] = 2;
+    check(isaac_input_keyboard_edge(cur, prev, 0x15d), "input edge: any nonzero current byte over a zero previous one (key 0, value 2)");
+    {
+        uint32_t w[8] = {0};
+        check(!isaac_input_pad_edge(w), "input edge (pad): nothing down");
+        static const char *const what[4] = {
+            "input edge (pad): a raw button 0..31 down now, not before ([+0x20] & ~[+0x28])",
+            "input edge (pad): a raw button 32..63 ([+0x24] & ~[+0x2c])",
+            "input edge (pad): an axis direction 0..31 ([+0x30] & ~[+0x38])",
+            "input edge (pad): an axis direction 32..63 ([+0x34] & ~[+0x3c])" };
+        static const int at[4] = { 0, 1, 4, 5 };
+        for (int k = 0; k < 4; ++k) {
+            memset(w, 0, sizeof w);
+            w[at[k]] = 0x00010000u;
+            int on = isaac_input_pad_edge(w);
+            w[at[k] + 2] = 0x00010000u;                   /* the same bit held since the last update */
+            check(on && !isaac_input_pad_edge(w), what[k]);
+        }
+        memset(w, 0, sizeof w);
+        w[0] = 0x3u; w[2] = 0x1u;
+        check(isaac_input_pad_edge(w), "input edge (pad): one new bit beside one held one");
+        w[2] = 0x7u;
+        check(!isaac_input_pad_edge(w), "input edge (pad): a bit released (previous set, current clear) is no edge");
+    }
+
+    /* the decision: update 5 ms, render 15 ms, so every in-between pass would be skipped */
+    isaac_render_gate_reset();
+    check(isaac_render_gate_decide_input(100.0, 1, 1u, 1) == 0, "render gate (press): first sighting");
+    isaac_render_gate_resumed(100.0);
+    check(isaac_render_gate_decide_input(105.0, 1, 2u, 1) == 0 && isaac_render_gate_kept() == 0u,
+          "render gate (press): a tick's own pass is drawn anyway, and is not counted as kept for a press");
+    isaac_render_gate_presenting(120.0);
+    isaac_render_gate_resumed(121.0);
+    check(isaac_render_gate_decide_input(122.0, 1, 2u, 0) == 1,
+          "render gate (press): an in-between pass with no press is skipped (122 - 105 + 15 + 5 = 37)");
+    isaac_render_gate_resumed(137.0);
+    check(isaac_render_gate_decide_input(142.0, 1, 3u, 0) == 0, "render gate (press): the next tick");
+    isaac_render_gate_presenting(157.0);
+    isaac_render_gate_resumed(158.0);
+    uint32_t drawn = isaac_render_gate_drawn();
+    check(isaac_render_gate_decide_input(159.0, 1, 3u, 1) == 0 && isaac_render_gate_kept() == 1u
+          && isaac_render_gate_drawn() == drawn + 1u && isaac_render_gate_skipped() == 1u,
+          "render gate (press): the same pass holding a press is drawn, counted as drawn and as kept, not as skipped");
+    check(isaac_render_gate_pace_ms(160.0) > 6.66 && isaac_render_gate_pace_ms(160.0) == 0.0,
+          "render gate (press): and its present is paced like any drawn in-between frame (asked once)");
+    check(isaac_render_gate_decide_input(161.0, 1, 3u, 1) == 0 && isaac_render_gate_kept() == 1u,
+          "render gate (press): a later pass before the next tick is drawn anyway and keeps nothing more");
+
+    /* off the devices: the input manager's vector at [0x00c57b18 + 8, + 0xc) */
+    {
+        enum { SAVE = 0x200 };
+        static uint8_t save_mgr[16], save_cur[0x15d], save_prev[0x15d], save_area[SAVE];
+        const uint32_t mgr = 0x00c57b18u, area = ISAAC_STACK_TOP_VA - 0x30000u;
+        const uint32_t vec = area, kbd = area + 0x40u, pad = area + 0x100u;
+        memcpy(save_mgr, isaac_g(mgr), 16);
+        memcpy(save_cur, isaac_g(0x00c78c10u), 0x15d);
+        memcpy(save_prev, isaac_g(0x00c78950u), 0x15d);
+        memcpy(save_area, isaac_g(area), SAVE);
+        memset(isaac_g(area), 0, SAVE);
+        memset(isaac_g(0x00c78c10u), 0, 0x15d);
+        memset(isaac_g(0x00c78950u), 0, 0x15d);
+        isaac_w32(kbd, 0x00ba1678u);
+        isaac_w32(pad, 0x00b82c80u);
+        isaac_w32(vec + 0, kbd); isaac_w32(vec + 8, pad);
+        isaac_w32(mgr + 8, vec); isaac_w32(mgr + 0xc, vec + 16);
+        check(isaac_input_edge_now() == 0, "input edge (devices): a keyboard and a pad, nothing down");
+        *(uint8_t *)isaac_g(0x00c78c10u + 0x2cu) = 1;
+        check(isaac_input_edge_now() == 1, "input edge (devices): a key down now and not before ([0x00c78c10] over [0x00c78950])");
+        *(uint8_t *)isaac_g(0x00c78950u + 0x2cu) = 1;
+        check(isaac_input_edge_now() == 0, "input edge (devices): the same key held");
+        isaac_w32(pad + 0x30u, 0x8u);
+        check(isaac_input_edge_now() == 2, "input edge (devices): a pad axis direction new in [pad+0x30]");
+        isaac_w32(pad + 0x38u, 0x8u);
+        check(isaac_input_edge_now() == 0, "input edge (devices): and held");
+        isaac_w32(pad + 0x24u, 0x1u);
+        isaac_w32(mgr + 0xc, vec + 8);                    /* the pad no longer in the vector */
+        check(isaac_input_edge_now() == 0, "input edge (devices): a device outside [+8, +0xc) is not read");
+        isaac_w32(mgr + 0xc, vec + 16);
+        check(isaac_input_edge_now() == 2, "input edge (devices): back in the vector, its new button is read");
+        isaac_w32(pad, 0x00b78030u);                      /* NetInputDevice's vtable */
+        check(isaac_input_edge_now() == 0, "input edge (devices): another device class is not read as a pad");
+        isaac_w32(kbd, 0x00b78030u);
+        *(uint8_t *)isaac_g(0x00c78950u + 0x2cu) = 0;
+        check(isaac_input_edge_now() == 0, "input edge (devices): the key arrays are read only when a keyboard device is there");
+        isaac_w32(kbd, 0x00ba1678u);
+        check(isaac_input_edge_now() == 1, "input edge (devices): and are read again with the keyboard back");
+        isaac_w32(mgr + 0xc, vec + 12);
+        check(isaac_input_edge_now() == 0, "input edge (devices): a vector whose size is not a multiple of 8 is not read");
+        memcpy(isaac_g(mgr), save_mgr, 16);
+        memcpy(isaac_g(0x00c78c10u), save_cur, 0x15d);
+        memcpy(isaac_g(0x00c78950u), save_prev, 0x15d);
+        memcpy(isaac_g(area), save_area, SAVE);
+    }
+}
+
 /* Round 36: the OpenAL model (host_audio.c) advances on THIS clock in the
  * selftest -- its isaac_audio_clock_ms is weak -- so the retire rules are
  * checked at exact instants; and its backend hooks (weak no-ops in the node
@@ -700,6 +1173,14 @@ static int selftest_preader(const char *src, uint8_t *dst, uint32_t off, uint32_
     return (int)len;
 }
 
+/* Round 107: a reader that always fails, and the page's "is this file ranged" */
+static int selftest_preader_fail(const char *src, uint8_t *dst, uint32_t off, uint32_t len) {
+    (void)src; (void)dst; (void)off; (void)len;
+    ++g_pread_calls;
+    return -1;
+}
+static int selftest_ranged_test(const char *src) { return strstr(src, "mods/packed/") != NULL; }
+
 /* Read through the guest API, including EOF. A writable close also lets the
  * persist hook observe which allocation backs the file, without exposing
  * private FS entries to the tests. These fixtures fit in the supplied scratch. */
@@ -739,8 +1220,11 @@ static int selftest_fs_read_is(uint32_t scratch, const char *path,
 
 int main(int argc, char **argv) {
     test_render_gate();
+    test_input_edges();
     test_thread_naps();
     test_lazy_textures();
+    test_gl_rgb_widen();
+    test_img_keep();
     test_lazy_sound();
     test_eh();
     printf("--- isaac host layer selftest ---\n");
@@ -999,6 +1483,74 @@ int main(int argc, char **argv) {
         uint32_t e = isaac_guest_alloc(64);
         check(e == d, "a double free is ignored and the block is reused exactly once");
         isaac_guest_free(e);
+    }
+
+    /* Round 101: a full arena overflows into segments from the host heap instead
+     * of answering NULL (a long run, or a mod's Lua heap, ended the game there).
+     * Five 96 MiB blocks cannot all lie in a 384 MiB arena: the ones that do not
+     * fit must come from above the host base, be guest memory to every check,
+     * hold their bytes, and go back on the same lists when freed. */
+    {
+        extern uint32_t isaac_guest_alloc(uint32_t n);
+        extern void     isaac_guest_free(uint32_t p);
+        extern uint32_t isaac_guest_realloc(uint32_t p, uint32_t n);
+        extern uint32_t isaac_heap_overflow_segments(void);
+        extern uint32_t isaac_heap_largest_free(void);
+        extern uint32_t isaac_heap_free_blocks(void);
+        extern uint64_t isaac_heap_live(void);
+        enum { NBIG = 5 };
+        const uint32_t CH = 96u << 20;
+        const uint32_t arena_largest = isaac_heap_largest_free(), arena_blocks = isaac_heap_free_blocks();
+        const uint64_t live0 = isaac_heap_live();
+        uint32_t big[NBIG], above = 0, below = 0;
+        int all = 1, guest = 1, bytes_ok = 1;
+        check(isaac_heap_overflow_segments() == 0, "no overflow segment while the arena has room");
+        check(!isaac_is_guest_va(ISAAC_HOST_BASE_VA + 0x40u), "host memory is not guest memory before any overflow");
+        for (int i = 0; i < NBIG; ++i) {
+            big[i] = isaac_guest_alloc(CH);
+            if (!big[i]) { all = 0; continue; }
+            if (big[i] >= ISAAC_HOST_BASE_VA) ++above; else ++below;
+            guest &= isaac_is_guest_va(big[i]) && isaac_is_guest_va(big[i] + CH - 1u);
+            memset(isaac_g(big[i]), 0xA0 + i, 64);
+            memset(isaac_g(big[i] + CH - 64u), 0xB0 + i, 64);
+        }
+        printf("      five 96 MiB blocks: %u in the arena, %u in %u overflow segment(s)\n",
+               below, above, isaac_heap_overflow_segments());
+        check(all, "five 96 MiB blocks are all served although the arena holds 384 MiB");
+        check(above >= 2 && below >= 1 && isaac_heap_overflow_segments() == above,
+              "the blocks the arena cannot hold come from overflow segments above the host base");
+        check(guest, "an overflow block is guest memory to isaac_is_guest_va, first byte to last");
+        check(!isaac_is_guest_va(ISAAC_HOST_BASE_VA + 0x40u), "host memory outside the segments is still not guest memory");
+        for (int i = 0; i < NBIG && all; ++i) {
+            const uint8_t *q = (const uint8_t *)isaac_g(big[i]);
+            for (unsigned k = 0; k < 64u; ++k)
+                if (q[k] != (uint8_t)(0xA0 + i) || q[CH - 64u + k] != (uint8_t)(0xB0 + i)) bytes_ok = 0;
+        }
+        check(bytes_ok, "every block still holds its own bytes at both ends (no overlap across regions)");
+        {   /* small blocks while the arena is full: coalescing inside a segment, and the guards */
+            const uint32_t segs = isaac_heap_overflow_segments();
+            uint32_t a = isaac_guest_alloc(1000), b = isaac_guest_alloc(2000), c = isaac_guest_alloc(3000);
+            check(a && b && c, "small blocks are served while the arena is full");
+            uint32_t r = isaac_guest_alloc(48);
+            memset(isaac_g(r), 0x5a, 48);
+            r = isaac_guest_realloc(r, 70000);
+            check(r && ((const uint8_t *)isaac_g(r))[47] == 0x5a, "realloc keeps the old bytes with overflow in play");
+            isaac_guest_free(r);
+            isaac_guest_free(a); isaac_guest_free(c); isaac_guest_free(b);
+            isaac_guest_free(b);                                   /* a double free in whichever region */
+            check(isaac_heap_overflow_segments() <= segs + 1u, "small blocks do not take a segment each");
+        }
+        for (int i = 0; i < NBIG; ++i) if (big[i]) isaac_guest_free(big[i]);
+        isaac_guest_free(big[NBIG - 1]);                           /* double free of an overflow block: refused */
+        check(isaac_heap_live() == live0, "freeing everything returns the live count to where it was");
+        check(isaac_heap_largest_free() >= arena_largest && isaac_heap_free_blocks() <= arena_blocks + isaac_heap_overflow_segments(),
+              "the arena is one block again and each segment is one block (no coalescing across a region's end)");
+        {   /* the segments are reused, not multiplied */
+            const uint32_t segs = isaac_heap_overflow_segments();
+            for (int i = 0; i < NBIG; ++i) big[i] = isaac_guest_alloc(CH);
+            check(big[NBIG - 1] && isaac_heap_overflow_segments() == segs, "a second fill reuses the segments it already has");
+            for (int i = 0; i < NBIG; ++i) if (big[i]) isaac_guest_free(big[i]);
+        }
     }
 
     /* VirtualAlloc must also stay inside the guest range and zero its memory */
@@ -2951,10 +3503,905 @@ int main(int argc, char **argv) {
         isaac_guest_free(g);
     }
 
+    /* Round 100: a guest C function that re-enters itself through Lua must not
+     * start on its own live frame (StageAPI's nested include freed the outer
+     * include's strings twice), and a Lua error raised out of a guest function
+     * must leave the guest-call state, and the next call's frame, where they
+     * were when Lua was entered. */
+    {
+        uint32_t g = isaac_guest_alloc(64);
+        const uint32_t call_esp0 = g_guest_call_esp;
+        const uint32_t top = ISAAC_STACK_TOP_VA - 0x1000;   /* LFRAME's guest ESP */
+        unsigned shims = 99, calls = 99, k;
+        int same = 1;
+        strcpy((char *)isaac_g(g), "nest");
+        strcpy((char *)isaac_g(g + 16), "boom");
+        g_nest_name = g;
+        g_raise_fmt = g + 16;
+        LFRAME();
+        LARG(0, isaac_va(L));
+        LARG(1, SELFTEST_LUA_NEST);
+        LARG(2, 0);
+        imp_lua5_3_3r__lua_pushcclosure(&lc);
+        lua_setglobal(L, "nest");
+        LFRAME();
+        LARG(0, isaac_va(L));
+        LARG(1, SELFTEST_LUA_RAISE);
+        LARG(2, 0);
+        imp_lua5_3_3r__lua_pushcclosure(&lc);
+        lua_setglobal(L, "raise");
+
+        lua_getglobal(L, "nest");
+        LFRAME();
+        LARG(0, isaac_va(L));
+        LARG(1, 0);
+        LARG(2, 0);
+        LARG(3, 0);
+        imp_lua5_3_3r__lua_pcallk(&lc);
+        printf("      nested guest call: outer ESP 0x%08x, inner ESP 0x%08x\n", g_nest_esp[0], g_nest_esp[1]);
+        check(lc.EAX == LUA_OK && g_nest_calls == 2,
+              "a guest C function re-enters itself through Lua (the nested include)");
+        check(g_nest_esp[0] < top && g_nest_esp[1] < g_nest_esp[0] - 0xC0u,
+              "each guest call starts below the guest code that entered Lua");
+        check(g_nest_frame_intact == 1, "the outer call's frame survives the nested call");
+
+        luaL_loadstring(L, "for i = 1, 6 do pcall(raise) end");
+        LFRAME();
+        LARG(0, isaac_va(L));
+        LARG(1, 0);
+        LARG(2, 0);
+        LARG(3, 0);
+        imp_lua5_3_3r__lua_pcallk(&lc);
+        for (k = 1; k < 6; ++k) same &= g_raise_esp[k] == g_raise_esp[0];
+        printf("      six caught errors: first ESP 0x%08x, last 0x%08x\n", g_raise_esp[0], g_raise_esp[5]);
+        check(lc.EAX == LUA_OK && g_raise_calls == 6,
+              "six Lua errors raised out of a guest C function, each caught in Lua");
+        check(same && g_raise_esp[0] < top,
+              "a caught error leaves the next call's frame where the first one was");
+        check(g_guest_call_esp == call_esp0,
+              "the guest-call state is back to what it was when Lua was entered");
+        (void)isaac_lua_nest_probe(&shims, &calls);
+        check(shims == 0 && calls == 0, "no shim or call record outlives the calls");
+        isaac_guest_free(g);
+    }
+
+    /* Round 102: the bridge of the REPENTOGON-compatible layer (host_rgon.c),
+     * on this state: guest memory both ways, a std::string, a Lua function
+     * that passes for a C one, a userdata for a game object, a guest call with
+     * a `this`, and the gate that shows REPENTOGON to the mods named and to
+     * nobody else. */
+    {
+        extern void isaac_rgon_push_bridge(lua_State *L);
+        uint32_t g = isaac_guest_alloc(128);
+        memset(isaac_g(g), 0, 128);
+        isaac_w32(g, 0x11223344u);
+        strcpy((char *)isaac_g(g + 8), "short");             /* an inline std::string */
+        isaac_w32(g + 8 + 16, 5u); isaac_w32(g + 8 + 20, 15u);
+        isaac_rgon_push_bridge(L);
+        lua_setglobal(L, "B");
+        lua_pushinteger(L, (lua_Integer)g);
+        lua_setglobal(L, "G");
+        lua_pushinteger(L, (lua_Integer)SELFTEST_LUA_NEST);
+        lua_setglobal(L, "NESTVA");
+        static const char *script =
+            "local r = {}\n"
+            "r[1] = B.r32(G) == 0x11223344 and B.r8(G) == 0x44 and B.r16(G + 2) == 0x1122\n"
+            "B.w32(G + 4, 0xCAFEF00D) B.wf32(G + 40, 1.5) B.w8(G + 44, true)\n"
+            "r[2] = B.r32(G + 4) == 0xCAFEF00D and B.rf32(G + 40) == 1.5 and B.r8(G + 44) == 1 and B.i2f(B.f2i(0.25)) == 0.25\n"
+            "r[3] = B.stdstr(G + 8) == 'short' and B.str(G + 8) == 'short' and B.str(G + 8, 3) == 'sho'\n"
+            "r[4] = not pcall(B.r32, 0x10) and not pcall(B.r32, 0x1c000040) and not pcall(B.w32, 0xFFFFFFF0, 1)\n"
+            "local f = B.cfn(function(a, b) return a + b, 'x' end)\n"
+            "local a, b = f(2, 3)\n"
+            "r[5] = a == 5 and b == 'x'\n"
+            "local mt = { __index = { hello = function() return 'hi' end } }\n"
+            "local o = B.obj(mt, G, 0x00401000)\n"
+            "r[6] = type(o) == 'userdata' and B.ptr(o) == G and B.r32(B.ud(o)) == 0x00401000 and o.hello() == 'hi' and B.obj(mt, 0, 0x00401000) == nil\n"
+            "r[7] = B.ptr(nil) == 0 and B.ptr(true) == 1 and B.ptr(7) == 7\n"
+            "r[8] = not pcall(B.call, 0x10, nil)\n"
+            "local p = B.alloc(64) r[9] = p ~= 0 and B.r32(p) == 0 B.free(p)\n"
+            "return r[1] and r[2] and r[3] and r[4] and r[5] and r[6] and r[7] and r[8] and r[9],\n"
+            "  (r[1] and '' or '1')..(r[2] and '' or '2')..(r[3] and '' or '3')..(r[4] and '' or '4')..(r[5] and '' or '5')..(r[6] and '' or '6')..(r[7] and '' or '7')..(r[8] and '' or '8')..(r[9] and '' or '9')\n";
+        int ok = luaL_loadstring(L, script) == LUA_OK && lua_pcall(L, 0, 2, 0) == LUA_OK;
+        if (!ok) printf("      rgon bridge script: %s\n", lua_tostring(L, -1));
+        else if (!lua_toboolean(L, -2)) printf("      rgon bridge: failed part(s) %s\n", lua_tostring(L, -1));
+        check(ok && lua_toboolean(L, -2), "rgon bridge: memory, strings, cfn, obj and the refusals");
+        lua_settop(L, 0);
+        check(isaac_r32(g + 4) == 0xCAFEF00Du, "rgon bridge: a write lands in guest memory");
+
+        /* the gate: REPENTOGON is a global only for chunks under mods/<a named folder>/ */
+        static const char *gate = "B.gate({ id = 'layer' }, { ['allowed-mod'] = true })";
+        static const char *probe = "return REPENTOGON and REPENTOGON.id";
+        ok = luaL_loadstring(L, gate) == LUA_OK && lua_pcall(L, 0, 0, 0) == LUA_OK;
+        check(ok, "rgon gate: installs");
+        ok = luaL_loadbufferx(L, probe, strlen(probe), "@//mods/allowed-mod/main.lua", "t") == LUA_OK && lua_pcall(L, 0, 1, 0) == LUA_OK;
+        check(ok && lua_isstring(L, -1) && strcmp(lua_tostring(L, -1), "layer") == 0, "rgon gate: a named mod reads the table");
+        lua_settop(L, 0);
+        ok = luaL_loadbufferx(L, probe, strlen(probe), "@//mods/Allowed-Mod/lib/x.lua", "t") == LUA_OK && lua_pcall(L, 0, 1, 0) == LUA_OK;
+        check(ok && lua_isstring(L, -1), "rgon gate: by folder, whatever the case or the file");
+        lua_settop(L, 0);
+        ok = luaL_loadbufferx(L, probe, strlen(probe), "@//mods/other-mod/main.lua", "t") == LUA_OK && lua_pcall(L, 0, 1, 0) == LUA_OK;
+        check(ok && lua_isnil(L, -1), "rgon gate: any other mod reads nil");
+        lua_settop(L, 0);
+        ok = luaL_loadbufferx(L, probe, strlen(probe), "@resources/scripts/main.lua", "t") == LUA_OK && lua_pcall(L, 0, 1, 0) == LUA_OK;
+        check(ok && lua_isnil(L, -1), "rgon gate: and so does the game's own script");
+        lua_settop(L, 0);
+        ok = luaL_loadstring(L, "B.gate({ id = 'all' }, true) return REPENTOGON.id") == LUA_OK && lua_pcall(L, 0, 1, 0) == LUA_OK;
+        check(ok && lua_isstring(L, -1), "rgon gate: true lets every chunk in");
+        lua_settop(L, 0);
+        luaL_dostring(L, "B = nil G = nil NESTVA = nil B = nil setmetatable(_G, nil)");
+        lua_settop(L, 0);
+        isaac_guest_free(g);
+    }
+
+    /* Round 111: luabridge's __index (0x0085cd40) as a native lua_CFunction
+     * (host_lua.c lb_index_native). A class built the way luabridge builds
+     * one: methods in the metatable, getters in its __propget table, the
+     * base class's metatable in __parent. The lifted function is not in the
+     * selftest, so the ways that end in a throw go to a stand-in here, which
+     * answers "LIFTED" and counts. */
+    {
+        extern lua_CFunction isaac_lua_native_index(void);
+        extern void isaac_lua_native_set_guest(int (*fn)(lua_State *L, uint32_t va, unsigned slot));
+        extern void isaac_lua_native_set_mode(int mode);
+        extern void isaac_lua_native_counts(uint32_t out[6]);
+        lua_CFunction ix = isaac_lua_native_index();
+        uint32_t before = isaac_lua_trampolines_used();
+        LFRAME();
+        LARG(0, isaac_va(L));
+        LARG(1, 0x0085cd40u);
+        LARG(2, 0);
+        imp_lua5_3_3r__lua_pushcclosure(&lc);
+        check(lua_tocfunction(L, -1) == ix && isaac_lua_trampolines_used() == before,
+              "native __index: a closure the game makes of 0x0085cd40 is the native function, and takes no trampoline");
+        lua_settop(L, 0);
+        lua_pushcfunction(L, ix); lua_setglobal(L, "__ix");
+        lua_pushcfunction(L, selftest_ix_cf); lua_setglobal(L, "__ix_cf");
+        lua_pushcfunction(L, selftest_ix_getter); lua_setglobal(L, "__ix_getter");
+        lua_pushcfunction(L, selftest_ix_newobj); lua_setglobal(L, "__ix_newobj");
+        lua_pushcfunction(L, selftest_ix_selfptr); lua_setglobal(L, "__ix_selfptr");
+        isaac_lua_native_set_mode(1);
+        isaac_lua_native_set_guest(selftest_ix_lifted);
+        int ok = luaL_dostring(L,
+            "local base = { BaseMethod = __ix_cf, __propget = { BaseProp = __ix_getter } }\n"
+            "local mt = { Method = __ix_cf, __propget = { Prop = __ix_getter, Self = __ix_selfptr, Lua = function() end }, __parent = base }\n"
+            "mt.__index = __ix\n"
+            "__ix_mt, __ix_base = mt, base\n"
+            "__ix_obj = __ix_newobj(mt)\n") == LUA_OK;
+        check(ok, "native __index: the class is built");
+        g_ix_lifted = 0;
+        ok = luaL_dostring(L,
+            "local o = __ix_obj\n"
+            "assert(o.Method == __ix_cf, 'method')\n"
+            "assert(o.Prop == 'got', 'getter')\n"
+            "assert(__ix_last == o, 'the getter is handed the object')\n"
+            "assert(o.BaseMethod == __ix_cf, 'inherited method')\n"
+            "assert(o.BaseProp == 'got', 'inherited getter')\n"
+            "assert(o.Nothing == nil, 'a key no class in the chain has')\n"
+            "assert(o[7] == nil, 'a number key')\n"
+            "assert(select('#', __ix(o, 'Nothing')) == 1, 'one result')\n") == LUA_OK;
+        if (!ok) printf("      %s\n", lua_tostring(L, -1));
+        check(ok && g_ix_lifted == 0,
+              "native __index: method, getter (called with the object), inherited method and getter, a missing key, all native");
+        lua_settop(L, 0);
+        static const struct { const char *setup, *what; } fall[] = {
+            { "__ix_mt.Odd = function() end", "a Lua function where a method would be (\"not a cfunction\")" },
+            { "__ix_mt.Odd = 5", "a number where a method would be" },
+            { "__ix_base.__propget = nil", "a base class without a __propget table" },
+            { "__ix_base.__parent = 3", "a __parent that is not a table" },
+            { "__ix_mt.__propget.Odd = {}", "a getter that is not a C function" },
+        };
+        for (unsigned i = 0; i < sizeof fall / sizeof fall[0]; ++i) {
+            luaL_dostring(L, "__ix_mt.Odd = nil __ix_mt.__propget.Odd = nil __ix_base.__propget = { BaseProp = __ix_getter } __ix_base.__parent = nil");
+            lua_settop(L, 0);
+            luaL_dostring(L, fall[i].setup);
+            lua_settop(L, 0);
+            g_ix_lifted = 0;
+            ok = luaL_dostring(L, "return __ix_obj.Odd, 'end'") == LUA_OK;
+            char msg[200];
+            snprintf(msg, sizeof msg, "native __index: %s goes to the lifted function, the stack as it came", fall[i].what);
+            check(ok && g_ix_lifted == 1 && g_ix_top == 2 && lua_gettop(L) == 2 && lua_type(L, 1) == LUA_TSTRING
+                  && strcmp(lua_tostring(L, 1), "LIFTED") == 0, msg);
+            lua_settop(L, 0);
+        }
+        luaL_dostring(L, "__ix_mt.Odd = nil __ix_mt.__propget.Odd = nil __ix_base.__propget = { BaseProp = __ix_getter } __ix_base.__parent = nil");
+        lua_settop(L, 0);
+        g_ix_lifted = 0;
+        ok = luaL_dostring(L, "return __ix({}, 'Method')") == LUA_OK;
+        check(ok && g_ix_lifted == 1, "native __index: an object without a metatable goes to the lifted function");
+        lua_settop(L, 0);
+        /* verify mode: the lifted answer is returned, and checked */
+        uint32_t c0[6], c1[6];
+        isaac_lua_native_counts(c0);
+        isaac_lua_native_set_mode(2);
+        isaac_lua_native_set_guest(selftest_ix_reference);
+        ok = luaL_dostring(L, "local o = __ix_obj return o.Method, o.Prop, o.BaseProp, o.Nothing, o.Self") == LUA_OK;
+        isaac_lua_native_counts(c1);
+        check(ok && lua_gettop(L) == 5 && lua_tocfunction(L, 1) == selftest_ix_cf && lua_isstring(L, 2) && lua_isstring(L, 3)
+              && lua_isnil(L, 4) && lua_type(L, 5) == LUA_TUSERDATA && c1[4] - c0[4] == 5u && c1[5] == c0[5],
+              "native __index (verify): five lookups compared (a value userdata pointing into itself among them), no mismatch");
+        lua_settop(L, 0);
+        g_ix_ref_wrong = 1;                              /* a lifted answer that differs */
+        ok = luaL_dostring(L, "return __ix_obj.Prop") == LUA_OK;
+        isaac_lua_native_counts(c1);
+        check(ok && c1[5] == c0[5] + 1u && lua_type(L, -1) == LUA_TSTRING && strcmp(lua_tostring(L, -1), "wrong") == 0,
+              "native __index (verify): a differing lifted answer is counted, and is the one returned");
+        g_ix_ref_wrong = 0;
+        lua_settop(L, 0);
+        isaac_lua_native_set_mode(1);
+        isaac_lua_native_set_guest(NULL);
+        luaL_dostring(L, "__ix, __ix_cf, __ix_getter, __ix_newobj, __ix_selfptr, __ix_mt, __ix_base, __ix_obj, __ix_last, __ix_ref = nil");
+        lua_settop(L, 0);
+    }
+
+    /* Round 114: luabridge's __gc for an object whose destructor does nothing
+     * (host_lua.c 1d). The two shapes are written into guest memory as the
+     * image has them: a __gc of the template's shape with its key, the
+     * trivial destructor in its two forms (push imm8, push imm32), and a
+     * destructor that is not it. The lifted function is a stand-in that
+     * counts. */
+    {
+        extern uint32_t isaac_lua_gc_template_key(uint32_t va);
+        extern uint32_t isaac_lua_gc_trivial_dtor(uint32_t fn);
+        extern void isaac_lua_gc_native_counts(uint32_t out[4]);
+        extern void isaac_lua_native_set_guest(int (*fn)(lua_State *L, uint32_t va, unsigned slot));
+        extern void isaac_lua_native_set_mode(int mode);
+        extern uint32_t isaac_guest_alloc(uint32_t n);
+        static const uint8_t gc_t[31] = { 0x55, 0x8b, 0xec, 0x8b, 0x4d, 0x08, 0x68, 0, 0, 0, 0, 0xe8, 0, 0, 0, 0,
+                                          0x83, 0xc4, 0x04, 0x8b, 0xc8, 0x8b, 0x10, 0x6a, 0x00, 0xff, 0x12, 0x33, 0xc0, 0x5d, 0xc3 };
+        static const uint8_t dt8[36] = { 0x55, 0x8b, 0xec, 0xf6, 0x45, 0x08, 0x01, 0x56, 0x8b, 0xf1, 0xc7, 0x06, 0xc0, 0x53, 0xb7, 0x00,
+                                         0x74, 0x0b, 0x6a, 0x10, 0x56, 0xe8, 0, 0, 0, 0, 0x83, 0xc4, 0x08, 0x8b, 0xc6, 0x5e, 0x5d, 0xc2, 0x04, 0x00 };
+        static const uint8_t dt32[39] = { 0x55, 0x8b, 0xec, 0xf6, 0x45, 0x08, 0x01, 0x56, 0x8b, 0xf1, 0xc7, 0x06, 0xc0, 0x53, 0xb7, 0x00,
+                                          0x74, 0x0e, 0x68, 0xb0, 0x00, 0x00, 0x00, 0x56, 0xe8, 0, 0, 0, 0, 0x83, 0xc4, 0x08, 0x8b, 0xc6, 0x5e, 0x5d, 0xc2, 0x04, 0x00 };
+        const uint32_t code = isaac_guest_alloc(0x100), data = isaac_guest_alloc(0x20);
+        const uint32_t fgc = code, f8 = code + 0x40, f32 = code + 0x80, fbad = code + 0xc0;
+        const uint32_t vt8 = data, vt32 = data + 4, vtbad = data + 8, key = data + 12, key2 = data + 16;
+        uint8_t *pgc = (uint8_t *)isaac_g(fgc), *p8 = (uint8_t *)isaac_g(f8);
+        memcpy(pgc, gc_t, sizeof gc_t);
+        isaac_w32(fgc + 7u, key);
+        isaac_w32(fgc + 12u, 0x0085c3e0u - (fgc + 16u));
+        memcpy(p8, dt8, sizeof dt8);
+        isaac_w32(f8 + 22u, 0x00aef15cu - (f8 + 26u));
+        memcpy(isaac_g(f32), dt32, sizeof dt32);
+        isaac_w32(f32 + 25u, 0x00aef15cu - (f32 + 29u));
+        memcpy(isaac_g(fbad), dt8, sizeof dt8);                    /* the same body calling something else */
+        isaac_w32(fbad + 22u, 0x00424540u - (fbad + 26u));
+        isaac_w32(vt8, f8); isaac_w32(vt32, f32); isaac_w32(vtbad, fbad);
+
+        check(isaac_lua_gc_template_key(fgc) == key, "__gc shape: a function of the template's shape is known, with the key it pushes");
+        isaac_w32(fgc + 12u, 0x0085c590u - (fgc + 16u));
+        check(isaac_lua_gc_template_key(fgc) == 0u, "__gc shape: the same bytes calling another function are not it");
+        isaac_w32(fgc + 12u, 0x0085c3e0u - (fgc + 16u));
+        pgc[24] = 0x01;                                            /* push 1: the deleting destructor */
+        check(isaac_lua_gc_template_key(fgc) == 0u, "__gc shape: a destructor call with another flag is not it");
+        pgc[24] = 0x00;
+        check(isaac_lua_gc_template_key(f8) == 0u && isaac_lua_gc_template_key(0u) == 0u, "__gc shape: other code, and no address, are not it");
+
+        check(isaac_lua_gc_trivial_dtor(f8) == 0x00b753c0u && isaac_lua_gc_trivial_dtor(f32) == 0x00b753c0u,
+              "trivial destructor: both forms are known, with the vtable they store");
+        check(isaac_lua_gc_trivial_dtor(fbad) == 0u, "trivial destructor: the same body calling another function is not it");
+        p8[17] = 0x0c;
+        check(isaac_lua_gc_trivial_dtor(f8) == 0u, "trivial destructor: a jump to somewhere else is not it");
+        p8[17] = 0x0b; p8[11] = 0x46;                              /* mov [esi+disp8], ... */
+        check(isaac_lua_gc_trivial_dtor(f8) == 0u, "trivial destructor: a store somewhere else is not it");
+        p8[11] = 0x06; p8[3] = 0xf7;
+        check(isaac_lua_gc_trivial_dtor(f8) == 0u && isaac_lua_gc_trivial_dtor(fgc) == 0u, "trivial destructor: other code is not it");
+        p8[3] = 0xf6;
+        check(isaac_lua_gc_trivial_dtor(f8) == 0x00b753c0u, "trivial destructor: (the body is whole again)");
+
+        /* the class as luabridge leaves it: registry[key] = the class table, flagged with the
+         * boolean at 0x00c7f4b8, its "__const" table flagged too, both with the __gc */
+        LFRAME();
+        LARG(0, isaac_va(L));
+        LARG(1, fgc);
+        LARG(2, 0);
+        imp_lua5_3_3r__lua_pushcclosure(&lc);
+        lua_setglobal(L, "__gcn_gc");
+        lua_newtable(L);                                           /* class */
+        lua_newtable(L);                                           /* const */
+        for (int i = -2; i <= -1; ++i) {
+            lua_pushboolean(L, 1); lua_rawsetp(L, i - 1, isaac_g(0x00c7f4b8u));
+            lua_getglobal(L, "__gcn_gc"); lua_setfield(L, i - 1, "__gc");
+        }
+        lua_pushvalue(L, -1); lua_setfield(L, -3, "__const");
+        lua_setglobal(L, "__gcn_const");
+        lua_pushvalue(L, -1); lua_rawsetp(L, LUA_REGISTRYINDEX, isaac_g(key));
+        lua_setglobal(L, "__gcn_class");
+        lua_newtable(L);                                           /* another class: flagged, its own key */
+        lua_pushboolean(L, 1); lua_rawsetp(L, -2, isaac_g(0x00c7f4b8u));
+        lua_pushvalue(L, -1); lua_rawsetp(L, LUA_REGISTRYINDEX, isaac_g(key2));
+        lua_setglobal(L, "__gcn_other");
+        lua_pushcfunction(L, selftest_gcn_new); lua_setglobal(L, "__gcn_new");
+        lua_pushcfunction(L, selftest_gcn_vt); lua_setglobal(L, "__gcn_vt");
+        lua_pushinteger(L, (lua_Integer)vt8); lua_setglobal(L, "__gcn_vt8");
+        lua_pushinteger(L, (lua_Integer)vt32); lua_setglobal(L, "__gcn_vt32");
+        lua_pushinteger(L, (lua_Integer)vtbad); lua_setglobal(L, "__gcn_vtbad");
+        isaac_lua_native_set_mode(1);
+        isaac_lua_native_set_guest(selftest_gcn_guest);
+        lua_gc(L, LUA_GCSTOP, 0);                                  /* only the collections asked for here finalize */
+        uint32_t n0[4], n1[4];
+        g_gcn_calls = 0; g_gcn_store = 0;
+
+        isaac_lua_gc_native_counts(n0);
+        int ok = luaL_dostring(L, "__gcn_a = __gcn_new(__gcn_class, __gcn_vt8) __gcn_gc(__gcn_a) return __gcn_vt(__gcn_a)") == LUA_OK;
+        isaac_lua_gc_native_counts(n1);
+        check(ok && lua_tointeger(L, -1) == 0x00b753c0 && n1[0] == n0[0] + 1u && n1[1] == n0[1] && g_gcn_calls == 0u,
+              "native __gc: an object of the class with the trivial destructor gets its one store, and the game is not called");
+        lua_settop(L, 0);
+        isaac_lua_gc_native_counts(n0);
+        ok = luaL_dostring(L, "local a = __gcn_new(__gcn_const, __gcn_vt32) __gcn_gc(a) return __gcn_vt(a)") == LUA_OK;
+        isaac_lua_gc_native_counts(n1);
+        check(ok && lua_tointeger(L, -1) == 0x00b753c0 && n1[0] == n0[0] + 1u && g_gcn_calls == 0u,
+              "native __gc: so does one with the class's const table, and the destructor's other form");
+        lua_settop(L, 0);
+
+        isaac_lua_gc_native_counts(n0);
+        ok = luaL_dostring(L, "local a = __gcn_new(__gcn_class, __gcn_vtbad) __gcn_gc(a) return __gcn_vt(a)") == LUA_OK;
+        isaac_lua_gc_native_counts(n1);
+        check(ok && lua_tointeger(L, -1) == (lua_Integer)vtbad && n1[0] == n0[0] && n1[1] == n0[1] + 1u && g_gcn_calls == 1u
+              && g_gcn_va == fgc && g_gcn_top == 1,
+              "native __gc: another destructor runs in the game (the lifted __gc, the object alone on the stack), and nothing is stored");
+        lua_settop(L, 0);
+        g_gcn_calls = 0;
+        isaac_lua_gc_native_counts(n0);
+        ok = luaL_dostring(L, "local a = __gcn_new(__gcn_other, __gcn_vt8) __gcn_gc(a) local b = __gcn_new({}, __gcn_vt8) __gcn_gc(b) "
+                              "__gcn_gc(5) __gcn_gc({}) return __gcn_vt(a), __gcn_vt(b)") == LUA_OK;
+        isaac_lua_gc_native_counts(n1);
+        check(ok && lua_tointeger(L, -2) == (lua_Integer)vt8 && lua_tointeger(L, -1) == (lua_Integer)vt8
+              && n1[0] == n0[0] && n1[1] == n0[1] + 4u && g_gcn_calls == 4u && g_gcn_top == 1,
+              "native __gc: an object of another class, one with an unflagged metatable, a number and a table all go to the game (it raises its own error)");
+        lua_settop(L, 0);
+
+        /* the collector's own calls */
+        luaL_dostring(L, "__gcn_a = nil collectgarbage() collectgarbage()");
+        g_gcn_calls = 0;
+        isaac_lua_gc_native_counts(n0);
+        ok = luaL_dostring(L, "for i = 1, 100 do __gcn_new(__gcn_class, i % 2 == 0 and __gcn_vt8 or __gcn_vt32) end "
+                              "for i = 1, 7 do __gcn_new(__gcn_class, __gcn_vtbad) end collectgarbage() collectgarbage()") == LUA_OK;
+        isaac_lua_gc_native_counts(n1);
+        check(ok && n1[0] == n0[0] + 100u && n1[1] == n0[1] + 7u && g_gcn_calls == 7u,
+              "native __gc: a collection finalizes 100 trivial objects natively and 7 others in the game");
+
+        /* 1e: set by the game on a trivial object, a class table's __gc never runs */
+        {
+            extern void isaac_lua_nofin_set(int on);
+            extern void isaac_lua_nofin_counts(uint32_t out[2]);
+            uint32_t f0[2], f1[2];
+            lua_pushcfunction(L, selftest_gcn_newgame); lua_setglobal(L, "__gcn_newg");
+            isaac_lua_nofin_set(1);
+            /* a table with the class's __gc that is not the class (nor its const table) */
+            luaL_dostring(L, "__gcn_other.__gc = __gcn_gc collectgarbage() collectgarbage()");
+            g_gcn_calls = 0;
+            isaac_lua_nofin_counts(f0); isaac_lua_gc_native_counts(n0);
+            ok = luaL_dostring(L, "__gcn_newg(__gcn_other, __gcn_vt8) collectgarbage() collectgarbage()") == LUA_OK;
+            isaac_lua_nofin_counts(f1); isaac_lua_gc_native_counts(n1);
+            check(ok && f1[0] == f0[0] && f1[1] == f0[1] + 1u && n1[0] == n0[0] && n1[1] == n0[1] + 1u && g_gcn_calls == 1u,
+                  "no-finalizer: a table that only borrows a class's __gc keeps the mark, and its object is finalized in the game");
+            g_gcn_calls = 0;
+            isaac_lua_nofin_counts(f0); isaac_lua_gc_native_counts(n0);
+            ok = luaL_dostring(L, "local a = __gcn_newg(__gcn_class, __gcn_vt8) local b = __gcn_newg(__gcn_const, __gcn_vt32) "
+                                  "local same = getmetatable(a) == __gcn_class and getmetatable(b) == __gcn_const a, b = nil, nil "
+                                  "for i = 1, 50 do __gcn_newg(__gcn_class, i % 2 == 0 and __gcn_vt8 or __gcn_vt32) end "
+                                  "for i = 1, 3 do __gcn_newg(__gcn_class, __gcn_vtbad) end "
+                                  "__gcn_newg({}, __gcn_vt8) "
+                                  "collectgarbage() collectgarbage() return same") == LUA_OK;
+            isaac_lua_nofin_counts(f1); isaac_lua_gc_native_counts(n1);
+            check(ok && lua_toboolean(L, -1) && f1[0] == f0[0] + 52u && f1[1] == f0[1] + 4u,
+                  "no-finalizer: 52 trivial objects get the class table (or its const table) unmarked; 3 of another destructor and one with a plain table are set as Lua sets them");
+            check(n1[0] == n0[0] && n1[1] == n0[1] + 3u && g_gcn_calls == 3u,
+                  "no-finalizer: the collection calls no __gc for the 52, and the game's for the 3");
+            lua_settop(L, 0);
+            isaac_lua_nofin_set(0);
+            g_gcn_calls = 0;
+            isaac_lua_nofin_counts(f0); isaac_lua_gc_native_counts(n0);
+            ok = luaL_dostring(L, "__gcn_newg(__gcn_class, __gcn_vt8) collectgarbage() collectgarbage()") == LUA_OK;
+            isaac_lua_nofin_counts(f1); isaac_lua_gc_native_counts(n1);
+            check(ok && f1[0] == f0[0] && n1[0] == n0[0] + 1u && g_gcn_calls == 0u,
+                  "no-finalizer (off): the object is marked as Lua marks it, and finalized natively");
+            isaac_lua_nofin_set(1);
+            isaac_lua_native_set_mode(0);
+            isaac_lua_nofin_counts(f0);
+            ok = luaL_dostring(L, "__gcn_newg(__gcn_class, __gcn_vt8) collectgarbage() collectgarbage()") == LUA_OK;
+            isaac_lua_nofin_counts(f1);
+            check(ok && f1[0] == f0[0] && g_gcn_calls == 1u,
+                  "no-finalizer: with the lifted __gc asked for (mode 0) nothing is left unmarked");
+            isaac_lua_native_set_mode(1);
+            isaac_lua_nofin_set(-1);
+            luaL_dostring(L, "__gcn_newg = nil __gcn_other.__gc = nil");
+        }
+
+        /* the lifted function only (ISAAC_LUA_NATIVE=0), and both compared (=2) */
+        isaac_lua_native_set_mode(0);
+        g_gcn_calls = 0;
+        isaac_lua_gc_native_counts(n0);
+        ok = luaL_dostring(L, "local a = __gcn_new(__gcn_class, __gcn_vt8) __gcn_gc(a) return __gcn_vt(a)") == LUA_OK;
+        isaac_lua_gc_native_counts(n1);
+        check(ok && lua_tointeger(L, -1) == (lua_Integer)vt8 && n1[0] == n0[0] && n1[1] == n0[1] + 1u && g_gcn_calls == 1u,
+              "native __gc (mode 0): everything goes to the game");
+        lua_settop(L, 0);
+        isaac_lua_native_set_mode(2);
+        g_gcn_store = 0x00b753c0u;                                 /* the stand-in does what the lifted destructor does */
+        isaac_lua_gc_native_counts(n0);
+        ok = luaL_dostring(L, "local a = __gcn_new(__gcn_class, __gcn_vt8) __gcn_gc(a)") == LUA_OK;
+        isaac_lua_gc_native_counts(n1);
+        check(ok && n1[2] == n0[2] + 1u && n1[3] == n0[3], "native __gc (verify): the lifted function's store is the one expected");
+        g_gcn_store = 0;                                           /* a lifted destructor that stored nothing */
+        ok = luaL_dostring(L, "local a = __gcn_new(__gcn_class, __gcn_vt8) __gcn_gc(a)") == LUA_OK;
+        isaac_lua_gc_native_counts(n0);
+        check(ok && n0[2] == n1[2] + 1u && n0[3] == n1[3] + 1u, "native __gc (verify): a lifted function that left another vtable is counted");
+        g_gcn_store = 0x00b753c0u;
+        luaL_dostring(L, "collectgarbage() collectgarbage()");     /* what is left is finalized in verify mode, by a stand-in that stores */
+        isaac_lua_native_set_mode(1);
+
+        /* Round 121: luabridge's class check (0x0085c590) answered natively
+         * when the answer is yes (host_lua.c 1f). The classes above, plus one
+         * derived from __gcn_class (with its const table) and one derived
+         * from that. */
+        {
+            extern int isaac_lua_getclass_native(lua_State *L, int index, uint32_t key, int may_be_const, uint32_t *ud);
+            extern int isaac_lua_getclass(CpuState *restrict cpu);
+            extern void isaac_lua_getclass_verify(const CpuState *cpu);
+            extern void isaac_lua_getclass_counts(uint32_t out[4]);
+            luaL_dostring(L, "__gcl_dc = { __parent = __gcn_const } __gcl_d = { __parent = __gcn_class, __const = __gcl_dc } "
+                             "__gcl_d2 = { __parent = __gcl_d, __const = {} } __gcl_plain = {} __gcl_odd = { __parent = 3, __const = {} }");
+            static const char *const flagged[] = { "__gcl_dc", "__gcl_d", "__gcl_d2", "__gcl_odd" };
+            for (unsigned i = 0; i < 4; ++i) {
+                lua_getglobal(L, flagged[i]); lua_pushboolean(L, 1); lua_rawsetp(L, -2, isaac_g(0x00c7f4b8u)); lua_pop(L, 1);
+            }
+#  define GCL_OBJ(mt) (lua_settop(L, 0), lua_getglobal(L, "__gcn_new"), lua_getglobal(L, (mt)), lua_getglobal(L, "__gcn_vt8"), lua_call(L, 2, 1))
+#  define GCL_YES(may) (ud = 0u, isaac_lua_getclass_native(L, 1, key, (may), &ud) == 1 && ud == isaac_va(lua_touserdata(L, 1)) && lua_gettop(L) == 1)
+#  define GCL_NO(k, may) (ud = 0x77u, isaac_lua_getclass_native(L, 1, (k), (may), &ud) == 0 && ud == 0x77u && lua_gettop(L) == 1)
+            uint32_t ud = 0;
+            GCL_OBJ("__gcn_class");
+            check(GCL_YES(0) && GCL_YES(1), "class check: an object of the class is one, whether const objects may pass or not; the stack is as it came");
+            check(isaac_lua_getclass_native(L, -1, key, 1, &ud) == 0 && isaac_lua_getclass_native(L, 0, key, 1, &ud) == 0
+                  && isaac_lua_getclass_native(L, 2, key, 1, &ud) == 0 && lua_gettop(L) == 1,
+                  "class check: an index that is not a plain one within the stack is left to the game");
+            GCL_OBJ("__gcn_const");
+            check(GCL_YES(1), "class check: a const object passes where const objects may");
+            check(GCL_NO(key, 0), "class check: a const object where none may be is left to the game (it raises 'cannot be const')");
+            GCL_OBJ("__gcl_d");
+            check(GCL_YES(0), "class check: an object of a derived class is one of its base");
+            GCL_OBJ("__gcl_d2");
+            check(GCL_YES(0), "class check: so is one of a class derived from that");
+            GCL_OBJ("__gcl_dc");
+            check(GCL_YES(1) && GCL_NO(key, 0), "class check: a const object of a derived class, as a const object of the base");
+            GCL_OBJ("__gcn_other");
+            check(GCL_NO(key, 1), "class check: an object of another class is left to the game");
+            GCL_OBJ("__gcn_class");
+            check(GCL_NO(key2, 1), "class check: and an object of this class is not one of the other");
+            GCL_OBJ("__gcl_plain");
+            check(GCL_NO(key, 1), "class check: a userdata whose metatable is not one of luabridge's is left to the game");
+            GCL_OBJ("__gcl_odd");
+            check(GCL_NO(key, 1), "class check: a __parent that is not a table ends the walk without a fault");
+            lua_settop(L, 0); lua_newuserdata(L, 8);
+            check(GCL_NO(key, 1), "class check: a userdata with no metatable is left to the game");
+            lua_settop(L, 0); lua_newtable(L);
+            check(GCL_NO(key, 1), "class check: a table is left to the game");
+            lua_settop(L, 0); lua_pushinteger(L, 5);
+            check(GCL_NO(key, 1), "class check: a number is left to the game");
+            GCL_OBJ("__gcn_class");
+            check(GCL_NO(scratch, 1) && GCL_NO(0u, 1), "class check: a key with no class behind it, and no key, are left to the game");
+            /* a metatable that names the class as its parent but is not one of luabridge's */
+            luaL_dostring(L, "__gcl_fake = { __parent = __gcn_class, __const = {} }");
+            GCL_OBJ("__gcl_fake");
+            check(GCL_NO(key, 1), "class check: a metatable without luabridge's mark is not a class, whatever its __parent says");
+            /* a table that was given the class's metatable is not an object */
+            lua_settop(L, 0);
+            luaL_dostring(L, "return setmetatable({}, __gcl_d)");
+            check(lua_istable(L, 1) && GCL_NO(key, 1), "class check: a table with a class's metatable is left to the game (it is not a userdata)");
+            /* a negative index: with an object of another class under an object
+             * of this one, -2 is the other object now and this one after a push */
+            GCL_OBJ("__gcn_other");
+            lua_getglobal(L, "__gcn_new"); lua_getglobal(L, "__gcn_class"); lua_getglobal(L, "__gcn_vt8"); lua_call(L, 2, 1);
+            ud = 0x77u;
+            check(lua_gettop(L) == 2 && isaac_lua_getclass_native(L, -2, key, 1, &ud) == 0 && ud == 0x77u && lua_gettop(L) == 2
+                  && isaac_lua_getclass_native(L, 2, key, 1, &ud) == 1 && ud == isaac_va(lua_touserdata(L, 2)),
+                  "class check: a negative index is left to the game; the plain index of the same object is answered");
+            luaL_dostring(L, "__gcl_fake = nil");
+
+            /* the entry the lifted callers reach: registers and stack in, EAX and a plain ret out */
+            CpuState gc;
+            uint32_t g0[4], g1[4];
+#  define GCL_CPU(maybyte) do { memset(&gc, 0, sizeof gc); gc.ECX = isaac_va(L); gc.EDX = 1u; gc.EAX = 0xAAAAAAAAu; \
+                gc.ESP = ISAAC_STACK_TOP_VA - 0x2000u; isaac_w32(gc.ESP, 0x00401234u); isaac_w32(gc.ESP + 4u, key); isaac_w32(gc.ESP + 8u, (maybyte)); } while (0)
+            GCL_OBJ("__gcn_const");
+            const uint32_t want = isaac_va(lua_touserdata(L, 1));
+            isaac_lua_getclass_counts(g0);
+            GCL_CPU(0xFFFFFF01u);
+            int ra = isaac_lua_getclass(&gc);
+            isaac_lua_getclass_counts(g1);
+            check(ra == 1 && gc.EAX == want && gc.EIP == 0x00401234u && gc.ESP == ISAAC_STACK_TOP_VA - 0x2000u + 4u && g1[0] == g0[0] + 1u && g1[1] == g0[1],
+                  "class check (entry): answered: EAX is the userdata, the return address is taken and only it is popped");
+            GCL_CPU(0x00000100u);                                  /* the flag is a byte: 0x100 is 'may not be const' */
+            ra = isaac_lua_getclass(&gc);
+            isaac_lua_getclass_counts(g0);
+            check(ra == 0 && gc.EAX == 0xAAAAAAAAu && gc.EIP == 0u && gc.ESP == ISAAC_STACK_TOP_VA - 0x2000u && g0[1] == g1[1] + 1u && g0[0] == g1[0],
+                  "class check (entry): the 'may be const' flag is its low byte only; left to the game, the registers are untouched");
+            /* while the check's Lua calls run, the caller's guest ESP is on record, as under an
+             * import shim: a finalizer the collector runs then is placed below it (host_lua.c 1b) */
+            {
+                extern void isaac_lua_getclass_set_probe(void (*fn)(void));
+                extern uint32_t isaac_lua_nest_probe(unsigned *shims, unsigned *calls);
+                unsigned sh0 = 0, sh1 = 0;
+                const uint32_t before = isaac_lua_nest_probe(&sh0, NULL);
+                g_gcl_probe_esp = 0u; g_gcl_probe_shims = 0u;
+                isaac_lua_getclass_set_probe(selftest_gcl_probe);
+                GCL_CPU(1u);
+                ra = isaac_lua_getclass(&gc);
+                isaac_lua_getclass_set_probe(NULL);
+                const uint32_t after = isaac_lua_nest_probe(&sh1, NULL);
+                check(ra == 1 && g_gcl_probe_esp == ISAAC_STACK_TOP_VA - 0x2000u && g_gcl_probe_shims == sh0 + 1u && sh1 == sh0 && after == before,
+                      "class check (entry): the caller's guest ESP is on record while the check runs, and is dropped after it");
+                isaac_lua_getclass_counts(g0);
+            }
+            isaac_lua_native_set_mode(0);
+            GCL_CPU(1u);
+            check(isaac_lua_getclass(&gc) == 0 && gc.EAX == 0xAAAAAAAAu && (isaac_lua_getclass_counts(g1), g1[0] == g0[0] && g1[1] == g0[1]),
+                  "class check (mode 0): the lifted function is asked for everything");
+            isaac_lua_native_set_mode(2);
+            /* the lifted function's side is played here: it returns with a plain ret (ESP + 4) and its answer in EAX */
+            const uint32_t e0 = ISAAC_STACK_TOP_VA - 0x2000u;
+#  define GCL_LIFTED(esp_in, answer) do { gc.ESP = (esp_in) + 4u; gc.EAX = (answer); isaac_lua_getclass_verify(&gc); } while (0)
+            GCL_CPU(1u);
+            ra = isaac_lua_getclass(&gc);
+            GCL_LIFTED(e0, want);
+            isaac_lua_getclass_counts(g1);
+            check(ra == 2 && g1[0] == g0[0] + 1u && g1[2] == g0[2] && g1[3] == g0[3], "class check (verify): the lifted function's answer is the native one: no mismatch");
+            GCL_CPU(1u);
+            ra = isaac_lua_getclass(&gc);
+            GCL_LIFTED(e0, want + 8u);                              /* a lifted function that answered something else */
+            isaac_lua_getclass_counts(g0);
+            check(ra == 2 && g0[2] == g1[2] + 1u && g0[3] == g1[3], "class check (verify): another answer from the lifted function is counted");
+            GCL_CPU(1u);
+            ra = isaac_lua_getclass(&gc);                           /* ... and one that never came back (a Lua error unwound it) */
+            GCL_CPU(1u);
+            int rb = isaac_lua_getclass(&gc);
+            GCL_LIFTED(e0, want);
+            isaac_lua_getclass_counts(g1);
+            check(ra == 2 && rb == 2 && g1[3] == g0[3] + 1u && g1[2] == g0[2] && g1[0] == g0[0] + 1u,
+                  "class check (verify): a lifted run that did not return is counted as that, at the next call from that depth, and is not a mismatch");
+            /* a check inside another's lifted run (a finalizer run by one of its Lua calls): both are compared, nothing is miscounted */
+            GCL_CPU(1u);
+            ra = isaac_lua_getclass(&gc);
+            GCL_CPU(1u); gc.ESP = e0 - 0x100u; isaac_w32(gc.ESP, 0x00401234u); isaac_w32(gc.ESP + 4u, key); isaac_w32(gc.ESP + 8u, 1u);
+            rb = isaac_lua_getclass(&gc);
+            GCL_LIFTED(e0 - 0x100u, want);
+            GCL_LIFTED(e0, want);
+            isaac_lua_getclass_counts(g0);
+            check(ra == 2 && rb == 2 && g0[0] == g1[0] + 2u && g0[2] == g1[2] && g0[3] == g1[3],
+                  "class check (verify): a check made inside another's lifted run, and the outer one after it, are both compared");
+            /* the inner one unwound, the outer one returning */
+            GCL_CPU(1u);
+            ra = isaac_lua_getclass(&gc);
+            GCL_CPU(1u); gc.ESP = e0 - 0x100u; isaac_w32(gc.ESP, 0x00401234u); isaac_w32(gc.ESP + 4u, key); isaac_w32(gc.ESP + 8u, 1u);
+            rb = isaac_lua_getclass(&gc);
+            GCL_LIFTED(e0, want + 8u);
+            isaac_lua_getclass_counts(g1);
+            check(ra == 2 && rb == 2 && g1[3] == g0[3] + 1u && g1[2] == g0[2] + 1u && g1[0] == g0[0] + 1u,
+                  "class check (verify): an inner run that did not return is counted when the outer one does, whose own answer is still compared");
+            /* a return nobody waits for is not compared */
+            GCL_LIFTED(e0, want);
+            isaac_lua_getclass_counts(g0);
+            check(g0[0] == g1[0] && g0[2] == g1[2] && g0[3] == g1[3], "class check (verify): a return that was not awaited is nothing");
+            /* ... also a deeper one while an outer call is awaited: the outer one stays awaited and is compared when it returns */
+            GCL_CPU(1u);
+            ra = isaac_lua_getclass(&gc);
+            GCL_LIFTED(e0 - 0x200u, want + 8u);
+            isaac_lua_getclass_counts(g1);
+            GCL_LIFTED(e0, want);
+            isaac_lua_getclass_counts(g0);
+            check(ra == 2 && g1[0] == g0[0] - 1u && g1[2] == g0[2] && g0[3] == g1[3],
+                  "class check (verify): a deeper return nobody awaited leaves the outer call awaited, and it is compared when it returns");
+            /* 32 calls awaited inside one another are kept track of; the 33rd is left to the lifted function, uncompared */
+            {
+                int all2 = 1, r33;
+                for (unsigned d = 0; d < 32u; ++d) {
+                    GCL_CPU(1u); gc.ESP = e0 - 0x40u * d; isaac_w32(gc.ESP, 0x00401234u); isaac_w32(gc.ESP + 4u, key); isaac_w32(gc.ESP + 8u, 1u);
+                    all2 &= isaac_lua_getclass(&gc) == 2;
+                }
+                GCL_CPU(1u); gc.ESP = e0 - 0x40u * 32u; isaac_w32(gc.ESP, 0x00401234u); isaac_w32(gc.ESP + 4u, key); isaac_w32(gc.ESP + 8u, 1u);
+                r33 = isaac_lua_getclass(&gc);
+                isaac_lua_getclass_counts(g1);
+                for (unsigned d = 32u; d-- > 0u; ) GCL_LIFTED(e0 - 0x40u * d, want);
+                isaac_lua_getclass_counts(g0);
+                check(all2 && r33 == 0 && g0[0] == g1[0] + 32u && g0[2] == g1[2] && g0[3] == g1[3],
+                      "class check (verify): 32 nested calls are awaited and compared; a 33rd is left to the lifted function alone");
+            }
+#  undef GCL_LIFTED
+            isaac_lua_native_set_mode(1);
+            lua_settop(L, 0);
+            luaL_dostring(L, "__gcl_dc, __gcl_d, __gcl_d2, __gcl_plain, __gcl_odd = nil");
+#  undef GCL_OBJ
+#  undef GCL_YES
+#  undef GCL_NO
+#  undef GCL_CPU
+        }
+        luaL_dostring(L, "__gcn_gc, __gcn_class, __gcn_const, __gcn_other, __gcn_new, __gcn_vt, __gcn_vt8, __gcn_vt32, __gcn_vtbad, __gcn_a = nil collectgarbage()");
+        lua_pushnil(L); lua_rawsetp(L, LUA_REGISTRYINDEX, isaac_g(key));
+        lua_pushnil(L); lua_rawsetp(L, LUA_REGISTRYINDEX, isaac_g(key2));
+        isaac_lua_native_set_guest(NULL);
+        g_gcn_store = 0;
+        lua_gc(L, LUA_GCRESTART, 0);
+        lua_settop(L, 0);
+    }
+
+    /* Round 113: a collector step the game asks for between two cycles waits
+     * for the heap to grow (host_lua.c isaac_lua_gc). First the decision,
+     * then the wrapper on this state with Lua's own collector stopped, so
+     * only the steps made here collect. */
+    {
+        extern int isaac_lua_gc_defer(int count_kb, int base_kb, int in_cycle, int pct);
+        extern int isaac_lua_gc(lua_State *L, int what, int data);
+        extern void isaac_lua_gc_set_pct(int pct);
+        extern void isaac_lua_gc_counts(uint32_t out[4]);
+        extern int isaac_lua_gc_paused(lua_State *L);
+        extern int isaac_lua_gc_step_kb(int asked, int count_kb, int base_kb, int grew_kb, int pct);
+        extern int isaac_lua_gc_last_step(void);
+        extern void isaac_lua_gc_set_budget(double ms);
+        extern int isaac_lua_gc_last_slices(void);
+        uint32_t g0[4], g1[4];
+        check(isaac_lua_gc_defer(1000, 1000, 0, 25) == 1 && isaac_lua_gc_defer(1249, 1000, 0, 25) == 1,
+              "gc defer: a step between cycles waits while the heap has grown by less than pct");
+        check(isaac_lua_gc_defer(1250, 1000, 0, 25) == 0 && isaac_lua_gc_defer(5000, 1000, 0, 25) == 0,
+              "gc defer: at pct of growth the step is made");
+        check(isaac_lua_gc_defer(1000, 1000, 1, 25) == 0, "gc defer: a step inside a cycle is always made");
+        check(isaac_lua_gc_defer(1000, 1000, 0, 0) == 0 && isaac_lua_gc_defer(1000, 0, 0, 25) == 0,
+              "gc defer: off (pct 0), and before any cycle has ended, every step is made");
+        check(isaac_lua_gc_defer(1000000 + 32767, 1000000, 0, 25) == 1 && isaac_lua_gc_defer(1000000 + 32768, 1000000, 0, 25) == 0,
+              "gc defer: the growth waited for is at most 32 MB");
+        check(isaac_lua_gc_defer(0x7fffffff, 0x7ffffff0, 0, 400) == 1,
+              "gc defer: sizes near INT_MAX do not wrap");
+
+        check(isaac_lua_gc_step_kb(10000, 130000, 128000, 0, 25) == 1000,
+              "gc step: inside the allowance a step is a 128th of the heap");
+        check(isaac_lua_gc_step_kb(10000, 130000, 128000, 500, 25) == 2500 && isaac_lua_gc_step_kb(10000, 130000, 128000, -500, 25) == 1000,
+              "gc step: plus three times the heap's growth since the last pass (a shrink adds nothing)");
+        check(isaac_lua_gc_step_kb(10000, 1300, 1280, 0, 25) == 64 && isaac_lua_gc_step_kb(50, 130000, 128000, 0, 25) == 50
+              && isaac_lua_gc_step_kb(10000, 130000, 128000, 5000, 25) == 10000,
+              "gc step: never under 64 KB, never over what the game asked");
+        check(isaac_lua_gc_step_kb(10000, 128000 + 63999, 128000, 0, 25) == 1000 && isaac_lua_gc_step_kb(10000, 128000 + 64000, 128000, 0, 25) == 10000,
+              "gc step: a heap past twice the allowance is stepped as the game asks");
+        check(isaac_lua_gc_step_kb(10000, 130000, 128000, 0, 0) == 10000 && isaac_lua_gc_step_kb(10000, 130000, 0, 0, 25) == 10000,
+              "gc step: off (pct 0), and before any cycle has ended, a step is as asked");
+
+        lua_gc(L, LUA_GCSTOP, 0);
+        isaac_lua_gc_set_budget(1e9);                      /* the amount decides here, not the clock */
+        luaL_dostring(L, "__gc_live = {} for i = 1, 4000 do __gc_live[i] = { i } end");
+        lua_gc(L, LUA_GCCOLLECT, 0);                       /* asked of Lua itself: the collector is between cycles */
+        isaac_lua_gc_set_pct(25);
+        isaac_lua_gc_counts(g0);
+        int r0 = isaac_lua_gc(L, LUA_GCSTEP, 10000);
+        isaac_lua_gc_counts(g1);
+        int base = (int)g1[3];
+        check(isaac_lua_gc_paused(L) && r0 == 0 && g1[0] == g0[0] + 1u && g1[1] == g0[1] + 1u && g1[2] == g0[2] + 1u
+              && base > 0 && base == lua_gc(L, LUA_GCCOUNT, 0),
+              "gc: the first step finds the collector between cycles, keeps the heap's size and waits");
+        isaac_lua_gc_counts(g0);
+        int kept = 0;
+        for (int i = 0; i < 20; ++i) kept += isaac_lua_gc(L, LUA_GCSTEP, 10000);
+        isaac_lua_gc_counts(g1);
+        check(kept == 0 && g1[1] == g0[1] + 20u && g1[2] == g0[2] && lua_gc(L, LUA_GCCOUNT, 0) == base,
+              "gc: with no growth since the cycle, twenty steps of 10,000 are all deferred");
+        /* garbage worth more than a quarter of the heap */
+        luaL_dostring(L, "for i = 1, 100000 do local t = { i, i } end");
+        int grown = lua_gc(L, LUA_GCCOUNT, 0);
+        check(grown - base >= base / 4, "gc: (the test's garbage is more than a quarter of the heap)");
+        isaac_lua_gc_counts(g0);
+        int ended = 0, steps = 0;
+        while (!ended && steps < 10000) { ended = isaac_lua_gc(L, LUA_GCSTEP, 10000); ++steps; }
+        isaac_lua_gc_counts(g1);
+        int after = lua_gc(L, LUA_GCCOUNT, 0);
+        check(ended == 1 && g1[1] == g0[1] && g1[2] == g0[2] + 1u && (int)g1[3] == after && after < base + (grown - base) / 4,
+              "gc: past pct of growth the steps are made until the cycle ends, and the garbage is gone");
+        check(isaac_lua_gc(L, LUA_GCSTEP, 10000) == 0 && (isaac_lua_gc_counts(g0), g0[1] == g1[1] + 1u),
+              "gc: the step after that cycle is deferred again");
+
+        /* a cycle the game's steps began and someone else ended (Lua's own
+         * steps do, at an allocation; here a full collection asked of Lua
+         * itself): the next step must see it ended, and wait */
+        luaL_dostring(L, "for i = 1, 100000 do local t = { i, i } end");
+        steps = 0;
+        while (isaac_lua_gc_paused(L) && steps < 200000) { isaac_lua_gc(L, LUA_GCSTEP, 1); ++steps; }
+        check(!isaac_lua_gc_paused(L), "gc: (small steps past pct of growth begin a cycle and leave it unfinished)");
+        lua_gc(L, LUA_GCCOLLECT, 0);
+        luaL_dostring(L, "for i = 1, 100 do local t = { i } end");
+        isaac_lua_gc_counts(g0);
+        int r1 = isaac_lua_gc(L, LUA_GCSTEP, 10000);
+        isaac_lua_gc_counts(g1);
+        check(r1 == 0 && g1[1] == g0[1] + 1u && g1[2] == g0[2] + 1u && (int)g1[3] <= lua_gc(L, LUA_GCCOUNT, 0),
+              "gc: a cycle that someone else ended is seen as ended, and the next step waits");
+
+        /* a cycle someone else began while the game's steps were waiting: it
+         * is stepped as the game asks */
+        steps = 0;
+        while (isaac_lua_gc_paused(L) && steps < 200000) { lua_gc(L, LUA_GCSTEP, 1); ++steps; }
+        check(!isaac_lua_gc_paused(L), "gc: (steps asked of Lua itself begin a cycle)");
+        isaac_lua_gc_counts(g0);
+        ended = 0; steps = 0;
+        while (!ended && steps < 10000) { ended = isaac_lua_gc(L, LUA_GCSTEP, 10000); ++steps; }
+        isaac_lua_gc_counts(g1);
+        check(ended == 1 && g1[1] == g0[1] && g1[2] == g0[2] + 1u && isaac_lua_gc_paused(L),
+              "gc: a cycle someone else began is stepped as the game asks, to its end");
+
+        /* garbage just past the allowance, most of it before a pass that still
+         * waits: the step that is then made is the spread one, and begins the
+         * cycle without finishing it (the game's 10,000 KB would finish it) */
+        {
+            extern int isaac_lua_gc_room(int base_kb, int pct);
+            isaac_lua_gc_counts(g0);
+            const int b = (int)g0[3], room = isaac_lua_gc_room(b, 25);
+            steps = 0;
+            while (lua_gc(L, LUA_GCCOUNT, 0) - b < room * 85 / 100 && steps++ < 100000) luaL_dostring(L, "for i = 1, 50 do local t = { i } end");
+            const int before = lua_gc(L, LUA_GCCOUNT, 0);
+            isaac_lua_gc_counts(g0);
+            check(before - b < room && isaac_lua_gc(L, LUA_GCSTEP, 10000) == 0 && isaac_lua_gc_last_step() == 0
+                  && (isaac_lua_gc_counts(g1), g1[1] == g0[1] + 1u),
+                  "gc: under the allowance the step waits");
+            steps = 0;
+            while (lua_gc(L, LUA_GCCOUNT, 0) - b < room * 110 / 100 && steps++ < 100000) luaL_dostring(L, "for i = 1, 50 do local t = { i } end");
+            const int now = lua_gc(L, LUA_GCCOUNT, 0);
+            isaac_lua_gc_counts(g0);
+            isaac_lua_gc(L, LUA_GCSTEP, 10000);
+            isaac_lua_gc_counts(g1);
+            const int want = isaac_lua_gc_step_kb(10000, now, b, now - before, 25);
+            check(now - b >= room && now - b < 2 * room && g1[1] == g0[1] && want < 10000 && want >= 64
+                  && isaac_lua_gc_last_step() == want && !isaac_lua_gc_paused(L),
+                  "gc: just past the allowance the step made is the spread one: the cycle is begun and not finished");
+            steps = 0;
+            while (!isaac_lua_gc_paused(L) && steps < 10000) { isaac_lua_gc(L, LUA_GCSTEP, 10000); ++steps; }
+            check(isaac_lua_gc_paused(L) && steps > 1, "gc: and further spread steps finish it");
+
+            /* the same again with no time for more than one slice: the step stops after it */
+            steps = 0;
+            while (lua_gc(L, LUA_GCCOUNT, 0) - (int)(isaac_lua_gc_counts(g0), g0[3]) < isaac_lua_gc_room((int)g0[3], 25) * 110 / 100 && steps++ < 100000)
+                luaL_dostring(L, "for i = 1, 50 do local t = { i } end");
+            isaac_lua_gc_set_budget(1e9);
+            isaac_lua_gc(L, LUA_GCSTEP, 10000);
+            const int whole = isaac_lua_gc_last_slices(), size = isaac_lua_gc_last_step();
+            check(size > 16 && whole == (size + 15) / 16 && !isaac_lua_gc_paused(L),
+                  "gc: with time to spare a step is made whole, in slices of 16 KB");
+            isaac_lua_gc_set_budget(0.0);
+            isaac_lua_gc(L, LUA_GCSTEP, 10000);
+            check(isaac_lua_gc_last_step() >= 64 && isaac_lua_gc_last_slices() == 1,
+                  "gc: with the pass's time spent a step stops after one slice");
+            isaac_lua_gc_set_budget(1e9);
+            steps = 0;
+            while (!isaac_lua_gc_paused(L) && steps < 10000) { isaac_lua_gc(L, LUA_GCSTEP, 10000); ++steps; }
+        }
+
+        /* Round 117: a whole collection the game asks for (it does at every
+         * room entry). On a small heap it is made in the call; over 4 MB a
+         * cycle is owed and the steps after it make it, without the wait. */
+        {
+            extern int isaac_lua_gc_full_paced(int count_kb, int pct, int mode);
+            extern void isaac_lua_gc_set_full(int mode);
+            extern void isaac_lua_gc_full_counts(uint32_t out[3]);
+            uint32_t f0[3], f1[3];
+#  define GC_FIN() (lua_getglobal(L, "__gc_fin"), fin = (int)lua_tointeger(L, -1), lua_pop(L, 1), fin)
+#  define GC_DOOMED "setmetatable({}, { __gc = function() __gc_fin = __gc_fin + 1 end })"
+            int fin = 0;
+            check(isaac_lua_gc_full_paced(4096, 25, 1) == 0 && isaac_lua_gc_full_paced(4097, 25, 1) == 1,
+                  "gc whole: a heap over 4096 KB has its whole collection spread; at 4096 KB it is made in the call");
+            check(isaac_lua_gc_full_paced(100000, 0, 1) == 0 && isaac_lua_gc_full_paced(100000, 25, 0) == 0,
+                  "gc whole: with the pacing off, or its own switch off, it is made in the call at any size");
+            isaac_lua_gc_set_full(1);
+            luaL_dostring(L, "__gc_fin = 0 " GC_DOOMED);
+            isaac_lua_gc_full_counts(f0);
+            int rw = isaac_lua_gc(L, LUA_GCCOLLECT, 0);
+            isaac_lua_gc_full_counts(f1);
+            check(lua_gc(L, LUA_GCCOUNT, 0) <= 4096 && rw == 0 && GC_FIN() == 1 && f1[0] == f0[0] + 1u && f1[1] == f0[1] && f1[2] == 0u,
+                  "gc whole: on a small heap the collection is made in the call (the finalizer has run)");
+
+            luaL_dostring(L, "__gc_big = {} for i = 1, 60000 do __gc_big[i] = { i, i, i } end");
+            ended = 0; steps = 0;
+            while (!ended && steps < 10000) { ended = isaac_lua_gc(L, LUA_GCSTEP, 10000); ++steps; }
+            check(ended == 1 && lua_gc(L, LUA_GCCOUNT, 0) > 4096, "gc whole: (the test's heap is over 4 MB, and between cycles)");
+            luaL_dostring(L, GC_DOOMED);
+            isaac_lua_gc_full_counts(f0); isaac_lua_gc_counts(g0);
+            rw = isaac_lua_gc(L, LUA_GCCOLLECT, 0);
+            isaac_lua_gc_full_counts(f1); isaac_lua_gc_counts(g1);
+            check(rw == 0 && GC_FIN() == 1 && isaac_lua_gc_paused(L) && f1[0] == f0[0] + 1u && f1[1] == f0[1] + 1u && f1[2] == 1u
+                  && g1[2] == g0[2],
+                  "gc whole: on a big heap nothing is collected in the call, and a cycle is owed");
+            steps = 0;
+            while (isaac_lua_gc_paused(L) && steps < 2000) { isaac_lua_gc(L, LUA_GCSTEP, 10000); ++steps; }
+            isaac_lua_gc_counts(g1);
+            check(!isaac_lua_gc_paused(L) && g1[1] == g0[1] && isaac_lua_gc_last_step() >= 64 && isaac_lua_gc_last_step() < 10000,
+                  "gc whole: the steps after it are made with no growth to wait for, spread, and begin a cycle");
+            ended = 0; steps = 0;
+            while (!ended && steps < 10000) { ended = isaac_lua_gc(L, LUA_GCSTEP, 10000); ++steps; }
+            isaac_lua_gc_full_counts(f1); isaac_lua_gc_counts(g1);
+            check(ended == 1 && GC_FIN() == 2 && g1[2] == g0[2] + 1u && g1[1] == g0[1] && f1[2] == 0u,
+                  "gc whole: that cycle runs to its end, the finalizer has run, and nothing is owed");
+            check(isaac_lua_gc(L, LUA_GCSTEP, 10000) == 0 && (isaac_lua_gc_counts(g0), g0[1] == g1[1] + 1u),
+                  "gc whole: the step after it waits for growth again");
+
+            /* asked while a cycle runs: that cycle is the one */
+            luaL_dostring(L, "for i = 1, 100000 do local t = { i, i } end");
+            steps = 0;
+            while (isaac_lua_gc_paused(L) && steps < 200000) { isaac_lua_gc(L, LUA_GCSTEP, 1); ++steps; }
+            check(!isaac_lua_gc_paused(L), "gc whole: (small steps past the allowance begin a cycle)");
+            isaac_lua_gc_counts(g0);
+            rw = isaac_lua_gc(L, LUA_GCCOLLECT, 0);
+            isaac_lua_gc_full_counts(f1); isaac_lua_gc_counts(g1);
+            check(rw == 0 && !isaac_lua_gc_paused(L) && f1[2] == 1u && g1[2] == g0[2], "gc whole: asked while a cycle runs, the cycle goes on");
+            ended = 0; steps = 0;
+            while (!ended && steps < 10000) { ended = isaac_lua_gc(L, LUA_GCSTEP, 10000); ++steps; }
+            isaac_lua_gc_full_counts(f1); isaac_lua_gc_counts(g1);
+            check(ended == 1 && g1[2] == g0[2] + 1u && f1[2] == 0u && isaac_lua_gc(L, LUA_GCSTEP, 10000) == 0
+                  && (isaac_lua_gc_counts(g0), g0[1] == g1[1] + 1u),
+                  "gc whole: and is the one owed: after it the next step waits");
+
+            /* a cycle that ended unseen before the game asked is not the one owed */
+            luaL_dostring(L, "for i = 1, 100000 do local t = { i, i } end");
+            steps = 0;
+            while (isaac_lua_gc_paused(L) && steps < 200000) { isaac_lua_gc(L, LUA_GCSTEP, 1); ++steps; }
+            lua_gc(L, LUA_GCCOLLECT, 0);                   /* asked of Lua itself: the wrapper has not seen the end */
+            luaL_dostring(L, GC_DOOMED);
+            isaac_lua_gc_counts(g0);
+            rw = isaac_lua_gc(L, LUA_GCCOLLECT, 0);
+            isaac_lua_gc_full_counts(f1); isaac_lua_gc_counts(g1);
+            check(rw == 0 && GC_FIN() == 2 && f1[2] == 1u && g1[2] == g0[2] + 1u,
+                  "gc whole: a cycle that had ended unseen is counted as ended at the ask, and one is still owed");
+            ended = 0; steps = 0;
+            while (!ended && steps < 10000) { ended = isaac_lua_gc(L, LUA_GCSTEP, 10000); ++steps; }
+            isaac_lua_gc_full_counts(f1); isaac_lua_gc_counts(g0);
+            check(ended == 1 && GC_FIN() == 3 && f1[2] == 0u && g0[1] == g1[1] && g0[2] == g1[2] + 1u,
+                  "gc whole: the steps after it make that cycle with none deferred");
+
+            /* its switch off: made in the call at any size */
+            isaac_lua_gc_set_full(0);
+            luaL_dostring(L, GC_DOOMED);
+            isaac_lua_gc_full_counts(f0);
+            rw = isaac_lua_gc(L, LUA_GCCOLLECT, 0);
+            isaac_lua_gc_full_counts(f1);
+            check(rw == 0 && GC_FIN() == 4 && lua_gc(L, LUA_GCCOUNT, 0) > 4096 && f1[0] == f0[0] + 1u && f1[1] == f0[1] && f1[2] == 0u,
+                  "gc whole: with ISAAC_LUA_GC_ROOM=0 a big heap is collected in the call");
+            /* mode 2: over the threshold it is neither made nor owed; the step after it waits as any other */
+            isaac_lua_gc_set_full(2);
+            ended = 0; steps = 0;
+            while (isaac_lua_gc(L, LUA_GCSTEP, 10000) != 0 && steps < 100) ++steps;   /* between cycles, seen */
+            luaL_dostring(L, GC_DOOMED);
+            isaac_lua_gc_full_counts(f0); isaac_lua_gc_counts(g0);
+            rw = isaac_lua_gc(L, LUA_GCCOLLECT, 0);
+            int rs = isaac_lua_gc(L, LUA_GCSTEP, 10000);
+            isaac_lua_gc_full_counts(f1); isaac_lua_gc_counts(g1);
+            check(rw == 0 && rs == 0 && GC_FIN() == 4 && isaac_lua_gc_paused(L) && f1[0] == f0[0] + 1u && f1[1] == f0[1] + 1u && f1[2] == 0u
+                  && g1[1] == g0[1] + 1u && g1[2] == g0[2],
+                  "gc whole: with ISAAC_LUA_GC_ROOM=2 a big heap is not collected in the call and no cycle is owed (the next step waits)");
+            lua_gc(L, LUA_GCCOLLECT, 0);                   /* the test's last doomed object goes while its counter is still there */
+            check(GC_FIN() == 5, "gc whole: (asked of Lua itself, that object is collected)");
+            isaac_lua_gc_set_full(1);
+            luaL_dostring(L, "__gc_big = nil __gc_fin = nil");
+            lua_gc(L, LUA_GCCOLLECT, 0);
+            isaac_lua_gc(L, LUA_GCSTEP, 10000);            /* the wrapper sees the collector between cycles again */
+#  undef GC_FIN
+#  undef GC_DOOMED
+        }
+
+        luaL_dostring(L, "return #__gc_live");
+        check(lua_tointeger(L, -1) == 4000, "gc: what is alive stays");
+        lua_settop(L, 0);
+        isaac_lua_gc_set_pct(0);
+        luaL_dostring(L, "for i = 1, 1000 do local t = { i } end");
+        int before0 = lua_gc(L, LUA_GCCOUNT, 0);
+        ended = 0; steps = 0;
+        while (!ended && steps < 10000) { ended = isaac_lua_gc(L, LUA_GCSTEP, 10000); ++steps; }
+        isaac_lua_gc_counts(g0);
+        check(ended == 1 && g0[0] == 0u && g0[1] == 0u && lua_gc(L, LUA_GCCOUNT, 0) < before0,
+              "gc: with pct 0 a step with little garbage is made as asked");
+        luaL_dostring(L, "__gc_live = nil");
+        lua_gc(L, LUA_GCSETPAUSE, 200);                    /* set_pct(25) made it 125 */
+        isaac_lua_gc_set_budget(2.0);
+        lua_gc(L, LUA_GCRESTART, 0);
+        lua_settop(L, 0);
+    }
+
+    tl = isaac_lua_trampolines_used();
     LFRAME();
     LARG(0, isaac_va(L));
     imp_lua5_3_3r__lua_close(&lc);
-    check(isaac_lua_trampolines_used() == 2,
+    check(tl == 5 && isaac_lua_trampolines_used() == tl,   /* round 114: the __gc of the native-finalizer block is the fifth */
           "trampoline pool survives lua_close");
     isaac_guest_free(scratch);
     isaac_lua_report();
@@ -3715,6 +5162,101 @@ int main(int argc, char **argv) {
                 check(isaac_glc_fbo_status(0x8D40u, &st) && st == 0x8CD5u, "gl cache: deleting the bound framebuffer leaves the default bound");
                 isaac_glc_fbo_bind(0x8D40u, 3);
                 check(!isaac_glc_fbo_status(0x8D40u, &st), "gl cache: a deleted name comes back fresh");
+                {   /* round 118: a shape GL called complete is complete for other objects of that shape */
+#  define TEX_AS(name, w, h) do { isaac_glc_tex_bind(0x0DE1u, (name)); isaac_glc_tex_image(0x0DE1u); isaac_glc_tex_shape(0x0DE1u, 0, 0x8058u, (w), (h)); } while (0)
+#  define FBO_COLOR(fb, point, tex, level) do { isaac_glc_fbo_bind(0x8D40u, (fb)); isaac_glc_fbo_attach(0x8D40u, (point), 1, (tex), (0x0DE1u << 8) ^ (level)); } while (0)
+                    isaac_glc_fbo_shape_mode(1);
+                    isaac_glc_tex_active(0x84C0u);
+                    TEX_AS(31, 442, 286); TEX_AS(32, 442, 286); TEX_AS(33, 442, 287); TEX_AS(34, 442, 287);
+                    FBO_COLOR(40, 0x8CE0u, 31, 0);
+                    check(!isaac_glc_fbo_status(0x8D40u, &st), "fbo shape: a shape not seen before asks GL");
+                    isaac_glc_fbo_set_status(0x8D40u, 0x8CD5u);
+                    FBO_COLOR(41, 0x8CE0u, 32, 0);
+                    uint32_t h0 = isaac_glc_fbo_shape_hits();
+                    check(isaac_glc_fbo_status(0x8D40u, &st) && st == 0x8CD5u && isaac_glc_fbo_shape_hits() == h0 + 1u,
+                          "fbo shape: another framebuffer with another texture of that format and size is complete without asking");
+                    check(isaac_glc_fbo_status(0x8D40u, &st) && st == 0x8CD5u && isaac_glc_fbo_shape_hits() == h0 + 1u,
+                          "fbo shape: and then remembers it as its own");
+                    FBO_COLOR(42, 0x8CE0u, 33, 0);
+                    check(!isaac_glc_fbo_status(0x8D40u, &st), "fbo shape: a texture one row taller asks GL");
+                    isaac_glc_fbo_set_status(0x8D40u, 0x8CD6u);
+                    FBO_COLOR(45, 0x8CE0u, 34, 0);
+                    check(!isaac_glc_fbo_status(0x8D40u, &st), "fbo shape: an answer other than complete is not passed on to the shape");
+                    FBO_COLOR(43, 0x8CE0u, 32, 1);
+                    check(!isaac_glc_fbo_status(0x8D40u, &st), "fbo shape: another level of the texture asks GL");
+                    FBO_COLOR(44, 0x8CE1u, 32, 0);
+                    check(!isaac_glc_fbo_status(0x8D40u, &st), "fbo shape: the same texture at another attachment point asks GL");
+                    /* a texture whose image came by a call that does not say what it is */
+                    isaac_glc_tex_bind(0x0DE1u, 35); isaac_glc_tex_image(0x0DE1u);
+                    FBO_COLOR(46, 0x8CE0u, 35, 0);
+                    check(!isaac_glc_fbo_status(0x8D40u, &st), "fbo shape: a texture whose image was not seen asks GL");
+                    /* colour and a depth-stencil renderbuffer */
+                    isaac_glc_rb_bind(12); isaac_glc_rb_storage(0x88F0u, 442, 286, 0);
+                    isaac_glc_rb_bind(13); isaac_glc_rb_storage(0x88F0u, 442, 286, 0);
+                    isaac_glc_rb_bind(14); isaac_glc_rb_storage(0x81A5u, 442, 286, 0);
+                    isaac_glc_rb_bind(15); isaac_glc_rb_storage(0x88F0u, 442, 286, 4);
+                    FBO_COLOR(47, 0x8CE0u, 31, 0); isaac_glc_fbo_attach(0x8D40u, 0x821Au, 0, 12, 0);
+                    check(!isaac_glc_fbo_status(0x8D40u, &st), "fbo shape: colour with a depth-stencil renderbuffer is another shape");
+                    isaac_glc_fbo_set_status(0x8D40u, 0x8CD5u);
+                    FBO_COLOR(48, 0x8CE0u, 32, 0); isaac_glc_fbo_attach(0x8D40u, 0x821Au, 0, 13, 0);
+                    check(isaac_glc_fbo_status(0x8D40u, &st) && st == 0x8CD5u, "fbo shape: the same with another renderbuffer of that storage is complete");
+                    FBO_COLOR(49, 0x8CE0u, 32, 0); isaac_glc_fbo_attach(0x8D40u, 0x821Au, 0, 14, 0);
+                    check(!isaac_glc_fbo_status(0x8D40u, &st), "fbo shape: a renderbuffer of another format asks GL");
+                    FBO_COLOR(52, 0x8CE0u, 32, 0); isaac_glc_fbo_attach(0x8D40u, 0x821Au, 0, 15, 0);
+                    check(!isaac_glc_fbo_status(0x8D40u, &st), "fbo shape: a renderbuffer with another sample count asks GL");
+                    /* depth and stencil as two attachments: one image, or two */
+                    FBO_COLOR(53, 0x8CE0u, 31, 0); isaac_glc_fbo_attach(0x8D40u, 0x8D00u, 0, 12, 0); isaac_glc_fbo_attach(0x8D40u, 0x8D20u, 0, 12, 0);
+                    check(!isaac_glc_fbo_status(0x8D40u, &st), "fbo shape: (depth and stencil attached apart, one renderbuffer: a new shape)");
+                    isaac_glc_fbo_set_status(0x8D40u, 0x8CD5u);
+                    FBO_COLOR(54, 0x8CE0u, 32, 0); isaac_glc_fbo_attach(0x8D40u, 0x8D00u, 0, 13, 0); isaac_glc_fbo_attach(0x8D40u, 0x8D20u, 0, 13, 0);
+                    check(isaac_glc_fbo_status(0x8D40u, &st) && st == 0x8CD5u, "fbo shape: depth and stencil on one renderbuffer again is complete");
+                    FBO_COLOR(55, 0x8CE0u, 32, 0); isaac_glc_fbo_attach(0x8D40u, 0x8D00u, 0, 12, 0); isaac_glc_fbo_attach(0x8D40u, 0x8D20u, 0, 13, 0);
+                    check(!isaac_glc_fbo_status(0x8D40u, &st), "fbo shape: depth on one renderbuffer and stencil on another of that storage asks GL");
+                    /* the switch, a new image, a deleted texture */
+                    isaac_glc_fbo_shape_mode(0);
+                    FBO_COLOR(50, 0x8CE0u, 32, 0);
+                    check(!isaac_glc_fbo_status(0x8D40u, &st), "fbo shape: with ISAAC_GL_FBO_SHAPE=0 GL is asked");
+                    isaac_glc_fbo_shape_mode(1);
+                    check(isaac_glc_fbo_status(0x8D40u, &st) && st == 0x8CD5u, "fbo shape: (and answered again with it on)");
+                    TEX_AS(32, 100, 100);
+                    check(!isaac_glc_fbo_status(0x8D40u, &st), "fbo shape: a new image of another size for the attached texture asks GL");
+                    TEX_AS(32, 442, 286);
+                    check(isaac_glc_fbo_status(0x8D40u, &st) && st == 0x8CD5u, "fbo shape: the first size again is complete");
+                    isaac_glc_tex_delete(32);
+                    isaac_glc_tex_bind(0x0DE1u, 32); isaac_glc_tex_image(0x0DE1u);
+                    FBO_COLOR(51, 0x8CE0u, 32, 0);
+                    check(!isaac_glc_fbo_status(0x8D40u, &st), "fbo shape: a deleted texture leaves no shape to its name");
+                    /* two names on one entry of the table: the first is no longer known */
+                    TEX_AS(31, 442, 286); TEX_AS(31 + 4096, 442, 286);
+                    FBO_COLOR(56, 0x8CE0u, 31, 0);
+                    check(!isaac_glc_fbo_status(0x8D40u, &st), "fbo shape: a texture whose entry another name took asks GL");
+                    FBO_COLOR(57, 0x8CE0u, 31 + 4096, 0);
+                    check(isaac_glc_fbo_status(0x8D40u, &st) && st == 0x8CD5u, "fbo shape: and the one that took it is known");
+                    /* a level other than 0 is never answered by shape, even once GL has called one complete */
+                    TEX_AS(36, 300, 200); TEX_AS(37, 300, 200);
+                    FBO_COLOR(58, 0x8CE0u, 36, 1);
+                    check(!isaac_glc_fbo_status(0x8D40u, &st), "fbo shape: (level 1 of a texture asks GL)");
+                    isaac_glc_fbo_set_status(0x8D40u, 0x8CD5u);
+                    FBO_COLOR(59, 0x8CE0u, 37, 1);
+                    check(!isaac_glc_fbo_status(0x8D40u, &st), "fbo shape: level 1 of another texture of that size asks GL too");
+                    /* an image given by a call that does not say what it is: the shape seen before is forgotten */
+                    FBO_COLOR(60, 0x8CE0u, 36, 0);
+                    check(!isaac_glc_fbo_status(0x8D40u, &st), "fbo shape: (a 300 by 200 texture at level 0: a new shape)");
+                    isaac_glc_fbo_set_status(0x8D40u, 0x8CD5u);
+                    isaac_glc_tex_bind(0x0DE1u, 37); isaac_glc_tex_image(0x0DE1u);
+                    FBO_COLOR(61, 0x8CE0u, 37, 0);
+                    check(!isaac_glc_fbo_status(0x8D40u, &st), "fbo shape: a texture given a new image of unknown size is not known by its old one");
+                    /* a deleted texture's name, attached with no new image */
+                    TEX_AS(38, 300, 200);
+                    isaac_glc_tex_delete(38);
+                    FBO_COLOR(62, 0x8CE0u, 38, 0);
+                    check(!isaac_glc_fbo_status(0x8D40u, &st), "fbo shape: the name of a deleted texture has no shape");
+                    TEX_AS(38, 300, 200);
+                    check(isaac_glc_fbo_status(0x8D40u, &st) && st == 0x8CD5u, "fbo shape: (and with an image of that size again it is complete)");
+                    isaac_glc_fbo_bind(0x8D40u, 3);
+#  undef TEX_AS
+#  undef FBO_COLOR
+                }
                 check(!isaac_glc_loc_get(5, 1, "Transform", &loc), "gl cache: an unknown uniform asks GL");
                 isaac_glc_loc_put(5, 1, "Transform", 3);
                 check(isaac_glc_loc_get(5, 1, "Transform", &loc) && loc == 3, "gl cache: the uniform location is remembered");
@@ -3998,6 +5540,171 @@ int main(int argc, char **argv) {
                 }
                 isaac_fs_set_lazy_preader(NULL);
                 isaac_fs_set_window_min(0u);
+            }
+
+            /* Round 107: ranged lazy files (a packed mod's). Read in place
+             * through the positional reader at the guest's own offsets, never
+             * loaded whole; written, they become ordinary files; host code
+             * peeking at one gets nothing; with no positional reader they load
+             * whole as before. */
+            {
+                extern void isaac_fs_set_lazy_preader(int (*fn)(const char *, uint8_t *, uint32_t, uint32_t));
+                extern int isaac_fs_seed_lazy_ranged(const char *path, uint32_t len);
+                extern void isaac_fs_set_ranged_test(int (*fn)(const char *));
+                extern void isaac_fs_ranged_stats(uint32_t *, uint32_t *, uint64_t *, uint32_t *, uint32_t *);
+                extern const uint8_t *isaac_fs_peek(const char *path, uint32_t *len);
+                #define RG_CALL(fn, a0, a1, a2, a3) do { memset(&cpu, 0, sizeof cpu); cpu.ESP = ISAAC_STACK_TOP_VA - 0x1000; \
+                    isaac_w32(cpu.ESP, 0xDEADBEEF); isaac_w32(cpu.ESP + 4, (a0)); isaac_w32(cpu.ESP + 8, (a1)); \
+                    isaac_w32(cpu.ESP + 12, (a2)); isaac_w32(cpu.ESP + 16, (a3)); fn(&cpu); } while (0)
+                #define RG_PATH(s) do { const char *s_ = (s); for (unsigned i_ = 0; ; ++i_) { *(uint8_t *)isaac_g(pbuf + i_) = (uint8_t)s_[i_]; if (!s_[i_]) break; } } while (0)
+                #define RG_MODE(s) do { const char *s_ = (s); for (unsigned i_ = 0; ; ++i_) { *(uint8_t *)isaac_g(mbuf + i_) = (uint8_t)s_[i_]; if (!s_[i_]) break; } } while (0)
+                uint32_t big = ISAAC_HEAP_VA + 0x100000u;
+                uint32_t r_open0 = 0, r_reads0 = 0, r_fail0 = 0, r_copied0 = 0, r_open1 = 0, r_reads1 = 0, r_fail1 = 0, r_copied1 = 0;
+                isaac_fs_ranged_stats(&r_open0, &r_reads0, NULL, &r_fail0, &r_copied0);
+                isaac_fs_set_lazy_preader(selftest_preader);
+                uint32_t loads0 = isaac_fs_lazy_loads();
+#ifdef __EMSCRIPTEN__
+                size_t live0 = mallinfo().uordblks;
+#endif
+                check(isaac_fs_seed_lazy_ranged("data/Rng.bin", WIN_FILE_SIZE) == 1, "ranged: a 3 MB ranged entry registers by size");
+                unsigned p0 = g_pread_calls;
+                RG_PATH("data/Rng.bin"); RG_MODE("rb");
+                RG_CALL(imp_api_ms_win_crt_stdio__fopen, pbuf, mbuf, 0, 0);
+                uint32_t rh = cpu.EAX;
+                check(rh != 0 && g_pread_calls == p0, "ranged: opening it reads nothing");
+                RG_CALL(imp_api_ms_win_crt_stdio__fseek, rh, 12u, 0u, 0);
+                memset(isaac_g(big), 0xa5, 64);
+                RG_CALL(imp_api_ms_win_crt_stdio__fread, big, 1u, 16u, rh);
+                int ok16 = cpu.EAX == 16u;
+                for (uint32_t k = 0; k < 16u; ++k) ok16 &= *(uint8_t *)isaac_g(big + k) == win_byte(12u + k);
+                check(ok16 && g_pread_calls == p0 + 1u, "ranged: a 16-byte read at 12 is one positional read of exactly those bytes");
+                RG_CALL(imp_api_ms_win_crt_stdio__fgetc, rh, 0, 0, 0);
+                check(cpu.EAX == win_byte(28u) && g_pread_calls == p0 + 2u, "ranged: fgetc reads the next byte in place");
+                RG_CALL(imp_api_ms_win_crt_stdio__fseek, rh, WIN_FILE_SIZE - 4u, 0u, 0);
+                RG_CALL(imp_api_ms_win_crt_stdio__fread, big, 1u, 16u, rh);
+                check(cpu.EAX == 4u && *(uint8_t *)isaac_g(big + 3) == win_byte(WIN_FILE_SIZE - 1u), "ranged: a read past the end stops at the end");
+                RG_CALL(imp_api_ms_win_crt_stdio__fclose, rh, 0, 0, 0);
+#ifdef __EMSCRIPTEN__
+                check(mallinfo().uordblks < live0 + 65536u, "ranged: nothing of the 3 MB file stays in the host heap");
+#endif
+                check(isaac_fs_lazy_loads() == loads0, "ranged: the file is never loaded whole");
+                check(isaac_fs_peek("data/Rng.bin", NULL) == NULL, "ranged: isaac_fs_peek gets nothing for it");
+                /* the page's say-so (Module.isaacLazyRanged), here the C stand-in */
+                isaac_fs_set_ranged_test(selftest_ranged_test);
+                check(isaac_fs_seed_lazy("mods/packed/snd.wav", 1000u) == 1, "ranged: a plain lazy entry under mods/packed registers");
+                p0 = g_pread_calls;
+                RG_PATH("mods/packed/snd.wav");
+                RG_CALL(imp_api_ms_win_crt_stdio__fopen, pbuf, mbuf, 0, 0);
+                rh = cpu.EAX;
+                RG_CALL(imp_api_ms_win_crt_stdio__fread, big, 1u, 8u, rh);
+                check(cpu.EAX == 8u && g_pread_calls == p0 + 1u && *(uint8_t *)isaac_g(big + 7) == win_byte(7u) && isaac_fs_lazy_loads() == loads0,
+                      "ranged: an entry the page names ranged at first open is read in place");
+                RG_CALL(imp_api_ms_win_crt_stdio__fclose, rh, 0, 0, 0);
+                isaac_fs_set_ranged_test(NULL);
+                /* written: "ab" copies it in first, then appends */
+                check(isaac_fs_seed_lazy_ranged("data/RngA.bin", 5000u) == 1, "ranged: a 5000-byte ranged entry registers");
+                RG_PATH("data/RngA.bin"); RG_MODE("ab");
+                RG_CALL(imp_api_ms_win_crt_stdio__fopen, pbuf, mbuf, 0, 0);
+                rh = cpu.EAX;
+                memcpy(isaac_g(big), "XY", 2);
+                RG_CALL(imp_api_ms_win_crt_stdio__fwrite, big, 1u, 2u, rh);
+                RG_CALL(imp_api_ms_win_crt_stdio__fclose, rh, 0, 0, 0);
+                RG_MODE("rb");
+                isaac_fs_set_lazy_preader(NULL);           /* from here its bytes must be its own */
+                RG_CALL(imp_api_ms_win_crt_stdio__fopen, pbuf, mbuf, 0, 0);
+                rh = cpu.EAX;
+                RG_CALL(imp_api_ms_win_crt_stdio__fseek, rh, 4996u, 0u, 0);
+                RG_CALL(imp_api_ms_win_crt_stdio__fread, big, 1u, 16u, rh);
+                check(rh && cpu.EAX == 6u && *(uint8_t *)isaac_g(big) == win_byte(4996u) && *(uint8_t *)isaac_g(big + 3) == win_byte(4999u)
+                      && memcmp(isaac_g(big + 4), "XY", 2) == 0, "ranged: appended to, it was copied in first and kept its bytes");
+                RG_CALL(imp_api_ms_win_crt_stdio__fclose, rh, 0, 0, 0);
+                isaac_fs_set_lazy_preader(selftest_preader);
+                /* opened for appending and closed unwritten: copied in all the same */
+                check(isaac_fs_seed_lazy_ranged("data/RngC.bin", 300u) == 1, "ranged: a 300-byte ranged entry registers");
+                RG_PATH("data/RngC.bin"); RG_MODE("ab");
+                RG_CALL(imp_api_ms_win_crt_stdio__fopen, pbuf, mbuf, 0, 0);
+                rh = cpu.EAX;
+                RG_CALL(imp_api_ms_win_crt_stdio__fclose, rh, 0, 0, 0);
+                isaac_fs_set_lazy_preader(NULL);
+                RG_MODE("rb");
+                RG_CALL(imp_api_ms_win_crt_stdio__fopen, pbuf, mbuf, 0, 0);
+                rh = cpu.EAX;
+                RG_CALL(imp_api_ms_win_crt_stdio__fseek, rh, 290u, 0u, 0);
+                RG_CALL(imp_api_ms_win_crt_stdio__fread, big, 1u, 16u, rh);
+                check(rh && cpu.EAX == 10u && *(uint8_t *)isaac_g(big + 9) == win_byte(299u), "ranged: fopen for appending copies it in before any write");
+                RG_CALL(imp_api_ms_win_crt_stdio__fclose, rh, 0, 0, 0);
+                /* re-seeded with bytes of its own, it is an ordinary file */
+                check(isaac_fs_seed_lazy_ranged("data/RngE.bin", 5000u) == 1, "ranged: one more ranged entry registers");
+                RG_PATH("data/RngE.bin");
+                RG_CALL(imp_api_ms_win_crt_stdio__fopen, pbuf, mbuf, 0, 0);       /* opened once as ranged ... */
+                rh = cpu.EAX;
+                RG_CALL(imp_api_ms_win_crt_stdio__fclose, rh, 0, 0, 0);
+                check(isaac_fs_seed("data/RngE.bin", (const uint8_t *)"EAGER", 5u) == 1, "ranged: ... then seeded with five bytes");
+                RG_CALL(imp_api_ms_win_crt_stdio__fopen, pbuf, mbuf, 0, 0);
+                rh = cpu.EAX;
+                RG_CALL(imp_api_ms_win_crt_stdio__fread, big, 1u, 16u, rh);
+                check(cpu.EAX == 5u && memcmp(isaac_g(big), "EAGER", 5) == 0, "ranged: a re-seeded ranged entry reads its new bytes");
+                RG_CALL(imp_api_ms_win_crt_stdio__fclose, rh, 0, 0, 0);
+                isaac_fs_set_lazy_preader(selftest_preader);
+                /* "wb" starts it empty and reads nothing */
+                check(isaac_fs_seed_lazy_ranged("data/RngW.bin", 5000u) == 1, "ranged: another ranged entry registers");
+                p0 = g_pread_calls;
+                RG_PATH("data/RngW.bin"); RG_MODE("wb");
+                RG_CALL(imp_api_ms_win_crt_stdio__fopen, pbuf, mbuf, 0, 0);
+                rh = cpu.EAX;
+                memcpy(isaac_g(big), "Z", 1);
+                RG_CALL(imp_api_ms_win_crt_stdio__fwrite, big, 1u, 1u, rh);
+                RG_CALL(imp_api_ms_win_crt_stdio__fclose, rh, 0, 0, 0);
+                RG_MODE("rb");
+                RG_CALL(imp_api_ms_win_crt_stdio__fopen, pbuf, mbuf, 0, 0);
+                rh = cpu.EAX;
+                RG_CALL(imp_api_ms_win_crt_stdio__fread, big, 1u, 16u, rh);
+                check(cpu.EAX == 1u && *(uint8_t *)isaac_g(big) == 'Z' && g_pread_calls == p0, "ranged: opened with \"wb\" it starts empty and reads nothing");
+                RG_CALL(imp_api_ms_win_crt_stdio__fclose, rh, 0, 0, 0);
+                /* a failing reader: no bytes, counted, nothing invented */
+                isaac_fs_set_lazy_preader(selftest_preader_fail);
+                check(isaac_fs_seed_lazy_ranged("data/RngF.bin", 5000u) == 1, "ranged: a ranged entry whose reader fails registers");
+                RG_PATH("data/RngF.bin");
+                RG_CALL(imp_api_ms_win_crt_stdio__fopen, pbuf, mbuf, 0, 0);
+                rh = cpu.EAX;
+                RG_CALL(imp_api_ms_win_crt_stdio__fread, big, 1u, 16u, rh);
+                isaac_fs_ranged_stats(&r_open1, &r_reads1, NULL, &r_fail1, &r_copied1);
+                check(rh && cpu.EAX == 0u && r_fail1 == r_fail0 + 1u, "ranged: a failed positional read returns nothing and is counted");
+                RG_CALL(imp_api_ms_win_crt_stdio__fclose, rh, 0, 0, 0);
+                check(r_open1 >= r_open0 + 4u && r_reads1 > r_reads0 && r_copied1 == r_copied0 + 2u, "ranged: the census counts opens, reads and the two copy-ins");
+                /* no positional reader at all: loaded whole through the lazy reader, as before */
+                isaac_fs_set_lazy_preader(NULL);
+                isaac_fs_set_lazy_reader(selftest_lazy_reader);
+                check(isaac_fs_seed_lazy_ranged("data/RngL.bin", 6u) == 1, "ranged: a ranged entry registers where no positional reader exists");
+                RG_PATH("data/RngL.bin");
+                RG_CALL(imp_api_ms_win_crt_stdio__fopen, pbuf, mbuf, 0, 0);
+                rh = cpu.EAX;
+                RG_CALL(imp_api_ms_win_crt_stdio__fread, big, 1u, 6u, rh);
+                check(cpu.EAX == 6u && memcmp(isaac_g(big), "LAZY!!", 6) == 0 && isaac_fs_lazy_loads() == loads0 + 1u,
+                      "ranged: without a positional reader it is loaded whole as before");
+                RG_CALL(imp_api_ms_win_crt_stdio__fclose, rh, 0, 0, 0);
+                isaac_fs_set_lazy_reader(NULL);
+                /* a directory wider than the old 2,048-entry listing cap is listed whole */
+                {
+                    char wp[64];
+                    for (unsigned k = 0; k < 3000u; ++k) { snprintf(wp, sizeof wp, "data/wide/f%04u.png", k); isaac_fs_seed(wp, NULL, 0); }
+                    RG_PATH("data/wide/*");
+                    uint32_t fd = big + 0x1000u;
+                    RG_CALL(imp_kernel32__FindFirstFileA, pbuf, fd, 0, 0);
+                    uint32_t fh = cpu.EAX, seen = fh != 0xFFFFFFFFu ? 1u : 0u;
+                    while (fh != 0xFFFFFFFFu) {
+                        RG_CALL(imp_kernel32__FindNextFileA, fh, fd, 0, 0);
+                        if (!cpu.EAX) break;
+                        ++seen;
+                    }
+                    RG_CALL(imp_kernel32__FindClose, fh, 0, 0, 0);
+                    check(seen == 3000u, "FindFirstFileA lists all 3,000 files of a wide directory (the cap was 2,048)");
+                }
+                isaac_fs_set_lazy_preader(NULL);
+                RG_MODE("rb");
+                #undef RG_CALL
+                #undef RG_PATH
+                #undef RG_MODE
             }
             #undef FS_ATTR
         }

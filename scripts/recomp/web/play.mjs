@@ -20,13 +20,17 @@
 // frames (the drivers), ?autoplay=1 skips the Play button (headless runs),
 // ?persist=0 turns the save store off, ISAAC_*=... goes into the module's ENV.
 const $ = (id) => document.getElementById(id);
-import { createEditFileMenu, createPaperMenu, createMenuTag } from './menu_overlay.mjs';
+import { createEditFileMenu, createPaperMenu, createMenuTag, sampleReadout, saveFileKind, setIniOption, consoleRowStep, rowFramesState } from './menu_overlay.mjs';
 import { zipStore, unzip } from './zip.mjs';
 import { createModsMenu, openModDb, listMods, setModEnabled, MODS_DB } from './mods.mjs';
+import { createPackStore, createPackDownloader, createModUpdater } from './mods.mjs';
 import { createModBrowser } from './mod_browser.mjs';
 import { createPadKeys } from './gamepad.mjs';
 import { createTouchControls } from './touch_controls.mjs';
-const ROOT = new URL('.', location.href).pathname.replace(/\/$/, '');
+// The page's own folder. Relative to document.baseURI, not location.href: inside the
+// .svg build the page is an iframe's srcdoc, whose location is about:srcdoc (not a
+// base any URL can be resolved against) and whose base URL is the .svg's.
+const ROOT = new URL('.', document.baseURI).pathname.replace(/\/$/, '');
 const params = new URLSearchParams(location.search);
 // The pipeline's defaults: ISAAC_YIELD=1 selects the live page and, with no
 // frames=, an unlimited budget. Applied through hooks.params (round 76) rather
@@ -78,8 +82,21 @@ document.addEventListener('fullscreenchange', () => {
   if (document.fullscreenElement) kb.lock(['Escape']).catch(() => {});
   else try { kb.unlock(); } catch { /* not held */ }
 });
+// The game's debug console, when it is open, takes every key as text: the page's own
+// keys (F, N) must not act on a letter of a command (`goto s.default.1` has an f).
+// Console is Game+0x68d78 and its state its first dword -- 0 closed, 1 opening, 2 open,
+// 4 closing (docs/recomp-architecture.md, "The way in without WM_CHAR"; the same
+// offsets explore.mjs drives it by). Two reads of guest memory, on an F or N press only.
+const GAME_PTR = 0x00c71678, CONSOLE_OFF = 0x68d78;
+const consoleOpen = () => {
+  const G = window.isaacGuest;
+  if (!G) return false;
+  try { const game = G.u32(GAME_PTR); return !!game && G.u32(game + CONSOLE_OFF) !== 0; } catch { return false; }
+};
+window.isaacConsoleOpen = consoleOpen;                    // the drivers look at it
 window.addEventListener('keydown', (ev) => {
   if (pageInputTarget(ev.target)) return;
+  if ((ev.code === 'KeyF' || ev.code === 'KeyN') && consoleOpen()) return;
   if (ev.code === 'KeyF' && !ev.repeat && !ev.ctrlKey && !ev.altKey && !ev.metaKey && !$('saves').open && !(window.isaacEditFileMenu && window.isaacEditFileMenu.isOpen())
     && !(window.isaacModsMenu && window.isaacModsMenu.isOpen())) toggleFullscreen().catch(() => {});
   // N flips the FPS readout (round 52c-e; unbound in the game's default keys); the key still reaches the game
@@ -212,6 +229,7 @@ if (portable && typeof portable.progress === 'function' && window.__isaacPortabl
 // Check actual APIs before starting the pipeline, not browser names or versions.
 // The native engine still requires JSPI and a WebGL 2 context.
 let runtimeError = '';
+let gpuRenderer = 'gpu?';   // read off the probe context below, for the frame-rate line's machine note
 if (typeof WebAssembly === 'undefined' || typeof WebAssembly.Suspending !== 'function'
   || typeof WebAssembly.promising !== 'function') {
   runtimeError = 'This game requires WebAssembly JavaScript Promise Integration (JSPI). Update your browser or use a browser with JSPI support.';
@@ -220,6 +238,10 @@ if (typeof WebAssembly === 'undefined' || typeof WebAssembly.Suspending !== 'fun
   try { gl = document.createElement('canvas').getContext('webgl2'); } catch { /* unsupported or disabled */ }
   if (!gl) runtimeError = 'WebGL 2 is unavailable. Enable hardware graphics acceleration or use a browser and device that support WebGL 2.';
   else {
+    try {
+      const ext = gl.getExtension('WEBGL_debug_renderer_info');
+      if (ext) gpuRenderer = gl.getParameter(ext.UNMASKED_RENDERER_WEBGL);
+    } catch { /* the renderer string is only a note */ }
     const lose = gl.getExtension('WEBGL_lose_context');
     if (lose) lose.loseContext();
   }
@@ -272,6 +294,21 @@ if (portable && typeof portable.recordDownload === 'function')
   hooks.onDownload = (url, from, to) => portable.recordDownload(url, from, to);
 // Called before the output is connected, including delayed audio initialization
 // and context recreation. Only the destination is muted; the mixer stays live.
+// Round 107: a packed mod's file the game has waited on for a moment (boot_web.mjs:
+// its pack is being fetched) is said in a corner, so a pause is not taken for a hang.
+let packWaitEl = null;
+hooks.onModPackWait = (waiting) => {
+  if (!packWaitEl) {
+    if (!waiting) return;
+    packWaitEl = document.createElement('div');
+    packWaitEl.id = 'modpack-wait';
+    packWaitEl.textContent = 'Loading mod files...';
+    packWaitEl.style.cssText = 'position:fixed;left:12px;bottom:12px;z-index:30;padding:4px 10px;border-radius:4px;'
+      + 'background:rgba(0,0,0,.7);color:#eee;font:13px/1.4 sans-serif;pointer-events:none';
+    document.body.appendChild(packWaitEl);
+  }
+  packWaitEl.hidden = !waiting;
+};
 hooks.onAudioReady = (A) => {
   audioOutput = A.outputGain;
   audioOutput.gain.value = gameReady && !document.hidden ? 1 : 0;
@@ -434,15 +471,14 @@ hooks.beforeMain = (m) => new Promise((resolve) => {
     let last = window.isaacFrame || 0, lastT = performance.now(), first = true;
     let lastNoRaf = 0;   // round 49: frames the yield ticked on its timer (no animation frames)
     const recent = [];
+    const readout = {};   // the game's speed beside the frame count (menu_overlay.mjs, sampleReadout)
     // the machine, once: cores, memory (Chrome rounds it), the GPU renderer --
     // what a report from the target has to say alongside the frame rate
-    let machine = '';
-    try {
-      const gl = canvas.getContext('webgl2') || canvas.getContext('webgl');
-      const ext = gl && gl.getExtension('WEBGL_debug_renderer_info');
-      const renderer = ext ? gl.getParameter(ext.UNMASKED_RENDERER_WEBGL) : 'gpu?';
-      machine = ` -- ${navigator.hardwareConcurrency || '?'} cores, ${navigator.deviceMemory || '?'} GB, ${renderer}`;
-    } catch (e) { machine = ''; }
+    // Round 107: the renderer comes from the start-up probe's own context. Asking
+    // #canvas here created the game's context before the engine did, with the
+    // browser's default attributes (antialias and alpha on, no stencil, no
+    // preserved drawing buffer), and the engine's own request was then ignored.
+    const machine = ` -- ${navigator.hardwareConcurrency || '?'} cores, ${navigator.deviceMemory || '?'} GB, ${gpuRenderer}`;
     setInterval(() => {
       const f = window.isaacFrame || 0, t = performance.now();
       if (f <= 0) return;
@@ -453,10 +489,15 @@ hooks.beforeMain = (m) => new Promise((resolve) => {
       const med = [...recent].sort((a, b) => a - b)[Math.floor(recent.length / 2)];
       if (first) { first = false; render(); }
       const note = document.hidden ? ' -- paused while hidden' : (nrDelta > 0 ? ` -- no animation frames (${nrDelta} timer tick(s) this second: occluded?)` : '');
-      const line = `${fps.toFixed(0)} fps (median of the last ${recent.length} s: ${med.toFixed(0)}) -- frame ${f}${note}`;
+      // the game's logic counter (Game+0x264f8): 30 a second at full speed, whatever the frame count says
+      let ticks = null;
+      try { const G = window.isaacGuest, game = G && G.u32(0x00c71678); if (game) ticks = G.u32(game + 0x264f8); } catch { /* the guest is not up */ }
+      const { speed } = sampleReadout(readout, { frames: f, ticks, ms: t });
+      const slow = speed == null ? '' : `, the game at ${Math.round(speed * 100)}% speed`;
+      const line = `${fps.toFixed(0)} fps${slow} (median of the last ${recent.length} s: ${med.toFixed(0)}) -- frame ${f}${note}`;
       if (gameReady) setStatus('running', line + machine);
       const fpsEl = $('fps'); fpsEl.textContent = line; fpsEl.title = line + machine;   // the header's, live during play
-      editMenu.setFps(fps);                                                          // the in-game FPS VIEWER, when on
+      editMenu.setFps(fps, speed);                                                          // the in-game FPS VIEWER, when on
     }, 1000);
     watchScreen();
   };
@@ -510,6 +551,77 @@ function showError(title, text, ended = false) {
   $('error-text').textContent = text || '';
   $('errlog').textContent = crashExcerpt(window.isaacLog || []).join('\n');
   panel.hidden = false;
+  // a stop with mods on: the way out is on the panel, not behind the game's own menu
+  if (!ended) offerNoMods();
+}
+
+// ---- starting without mods (round 101) -------------------------------------------
+// A mod that stops the game during the boot left no way back in: the only place
+// to turn a mod off was the game's own MODS screen, behind the boot that the mod
+// had just broken (a player cleared the whole site, saves included, to get out).
+// Three ways out now, all the same move -- every mod is switched off in the
+// store, where a mod that is off is simply not seeded, and nothing is deleted:
+//   ?mods=0 in the address; the "Reload without mods" button on the error panel;
+//   and the question asked before the boot when the last boot with mods on never
+//   reached the game (a hang shows no panel at all, so the page has to notice).
+const BOOT_MARK = 'isaac-boot-with-mods';
+async function modsThatAreOn() {
+  if (typeof indexedDB === 'undefined') return [];
+  const dbs = (indexedDB.databases ? await indexedDB.databases().catch(() => null) : null);
+  if (dbs && !dbs.some((d) => d.name === MODS_DB)) return [];
+  let db = null;
+  try { db = await openModDb(); } catch { return []; }
+  if (!db) return [];
+  try { return (await listMods(db)).filter((m) => m.enabled !== false); } catch { return []; } finally { try { db.close(); } catch { /* gone */ } }
+}
+async function turnModsOff() {
+  let db = null, n = 0;
+  try { db = await openModDb(); } catch { return 0; }
+  if (!db) return 0;
+  try {
+    for (const mod of await listMods(db)) {
+      if (mod.enabled === false) continue;
+      await setModEnabled(db, mod.id, false);
+      n += 1;
+    }
+  } finally { try { db.close(); } catch { /* gone */ } }
+  try { localStorage.removeItem(BOOT_MARK); } catch { /* no storage */ }
+  console.log(`[mods] ${n} mod(s) turned off`);
+  return n;
+}
+window.isaacTurnModsOff = turnModsOff;
+function offerNoMods() {
+  const btn = $('nomods-btn');
+  if (!btn || !btn.hidden) return;
+  modsThatAreOn().then((on) => {
+    if (!on.length) return;
+    btn.textContent = on.length === 1 ? 'Reload without the mod' : `Reload without the ${on.length} mods`;
+    btn.hidden = false;
+  }, () => {});
+}
+// The question before the boot. Resolves when the player has chosen to try again;
+// choosing to start without mods reloads and never comes back here.
+function askAboutLastBoot(on) {
+  return new Promise((resolve) => {
+    const panel = $('error');
+    panel.className = '';
+    $('error-title').textContent = 'The game did not finish starting last time';
+    $('error-text').textContent = on.length === 1
+      ? `One mod is on (${on[0].name || on[0].id}). If the game stops or hangs again, start without it; it stays installed and can be turned back on.`
+      : `${on.length} mods are on. If the game stops or hangs again, start without them; they stay installed and can be turned back on.`;
+    $('errlog').textContent = on.map((m) => m.name || m.id).join('\n');
+    const btn = $('nomods-btn'), again = $('dismiss-btn'), was = again.textContent;
+    btn.textContent = on.length === 1 ? 'Start without the mod' : 'Start without mods';
+    btn.hidden = false;
+    again.textContent = 'Try again';
+    $('reload-btn').hidden = true; $('copylog-btn').hidden = true;
+    panel.hidden = false;
+    again.addEventListener('click', () => {
+      again.textContent = was; btn.hidden = true;
+      $('reload-btn').hidden = false; $('copylog-btn').hidden = false;
+      resolve();
+    }, { once: true });
+  });
 }
 // What the panel shows: the lines that led up to the stop, not the end of the
 // engine's report. A stop prints a long report (dispatch, fast paths, audio,
@@ -517,7 +629,7 @@ function showError(title, text, ended = false) {
 // the cause had scrolled out of the panel. The excerpt is the 18 lines before
 // the first line of a stop, and the stop's own lines; Copy log has the rest.
 function crashExcerpt(lines) {
-  const stop = /\[isaac\]\[(?:crt|TRAP|c\+\+|k32)\]|\[isaac\] =+ STOPPING|\[isaac\] reason:|\bnot found in\b|Unable to interpret GL_VERSION|No provider of|^\s*TRAP in |RESULT: |Aborted\(/;
+  const stop = /\[isaac\]\[(?:crt|TRAP|c\+\+|k32)\]|\[isaac\]\[heap\] (?:OUT OF MEMORY|double free)|\[isaac\] =+ STOPPING|\[isaac\] reason:|\bnot found in\b|Unable to interpret GL_VERSION|No provider of|^\s*TRAP in |RESULT: |Aborted\(/;
   const report = /^\[isaac\]\[(?:dispatch|fastpath|audio|audio-web|threads|input|web-gl|gl|profile|heap|stub|mod)\]|^\[isaac\]\s+\d+ x |stub report|^\s+\d+ x sub_/;
   const first = lines.findIndex((l) => stop.test(l));
   if (first < 0) return lines.slice(-24);
@@ -556,6 +668,21 @@ $('copylog-btn').addEventListener('click', () => {
   if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(text).then(done, () => {});
 });
 $('reload-btn').addEventListener('click', () => location.reload());
+// a page whose markup was built before round 101 has no such button: made here
+if (!$('nomods-btn')) {
+  const b = document.createElement('button');
+  b.id = 'nomods-btn'; b.type = 'button'; b.hidden = true; b.textContent = 'Reload without mods';
+  $('reload-btn').insertAdjacentElement('afterend', b);
+}
+$('nomods-btn').addEventListener('click', async () => {
+  $('nomods-btn').disabled = true;
+  try { await turnModsOff(); } catch (e) { console.warn('[mods] could not turn the mods off:', e.message); }
+  // the .svg build's page is an srcdoc (about:srcdoc): it has no query to clear, so a reload does
+  if (location.protocol === 'about:') { location.reload(); return; }
+  const u = new URL(location.href);
+  u.searchParams.delete('mods');
+  location.replace(u.href);
+});
 $('dismiss-btn').addEventListener('click', () => { $('error').hidden = true; });
 window.addEventListener('error', (ev) => showError('A script error', ev.message));
 window.addEventListener('unhandledrejection', (ev) => showError('The pipeline failed', String(ev.reason && ev.reason.message || ev.reason)));
@@ -605,6 +732,7 @@ const watchScreen = () => setInterval(() => {
   lastView = view;
   editMenu.setScreen(screen);
   modsTag.setShown(screen === MODS_SCREEN && still && !modsMenu.isOpen() && gameReady && modsBrowsable());
+  tendConsoleRow();
   if (screen === MODS_SCREEN && gameReady) syncGameMods();
 }, 200);
 
@@ -766,6 +894,7 @@ function checkReady() {
   readyCandidate.gameFrame = state.gameFrame;
   if (f < readyCandidate.frame + 2) return;
   gameReady = true;
+  try { localStorage.removeItem(BOOT_MARK); } catch { /* no storage */ }
   readyCandidate = null;
   renderProgress();
   overlay.hidden = true;
@@ -823,8 +952,11 @@ async function importSlot(slot) {
       items.push({ key: renumber(f && f.key ? f.key : e.name, slot), src: renumber(f && f.src ? f.src : e.name, slot), bytes: e.bytes });
     }
   } else {
-    // a bare .dat: this file's persistentgamedata (or gamestate, by its name)
-    const kind = /gamestate/i.test(file.name) ? 'gamestate' : 'persistentgamedata';
+    // a bare .dat: this file's persistentgamedata (or gamestate), told by its first
+    // bytes. The picker has no accept list (an iPhone's would grey a .dat out), so
+    // whatever else is chosen stops here instead of being written over a save.
+    const kind = saveFileKind(buf);
+    if (!kind) throw new Error('NOT A SAVE FILE');
     const hit = existing.find((it) => new RegExp(`${kind}${slot + 1}\\.dat$`, 'i').test(entryName(it.key, it.src)));
     items.push({ key: hit ? hit.key : `c:/isaac/documents/my games/binding of isaac repentance+/${kind}${slot + 1}.dat`, src: hit ? hit.src : '', bytes: buf });
   }
@@ -884,9 +1016,43 @@ const modBrowser = createModBrowser({
   log: (line) => console.log(line),
   touch: () => document.documentElement.classList.contains('isaac-touch'),
 });
+// Round 108: one pack store for the page -- the game's reads of a packed mod and the
+// background download of the rest of it share it (and so share a download both
+// want) -- and that download, started once a packed mod is installed and again by
+// every boot (boot_web.mjs) until every pack is kept. ?packbg=0 leaves it off.
+// Their lines go where boot_web.mjs's own store put them too: the game's log, once there is one.
+const packLog = (line) => { console.log(line); if (Array.isArray(window.isaacLog)) window.isaacLog.push(String(line)); };
+const packStore = createPackStore({ log: packLog });
+const packDownloader = params.get('packbg') === '0' ? null
+  : createPackDownloader({ store: packStore, log: packLog });
+hooks.packStore = packStore;
+hooks.packDownloader = packDownloader;
+// Round 116: the mods installed from the catalogue follow the catalogue this page pins
+// (mods.mjs createModUpdater): checked from here on, in parallel with the boot, which
+// waits for it just before it reads the mods -- at most ?modupdatewait= ms (2500); what
+// is not done by then is written after the game has read its mods, for the next start.
+// No mod from the catalogue installed: nothing is fetched. ?modupdate=0 leaves it off.
+// Its lines are held until the boot's log exists (boot_web.mjs makes it) and go there.
+const modCatalogue = params.get('catalogue') || (typeof window !== 'undefined' ? window.isaacModCatalogue : null) || null;
+let modUpdateLines = [];
+const modUpdateLog = (line) => {
+  console.log(line);
+  if (modUpdateLines) modUpdateLines.push(String(line)); else if (Array.isArray(window.isaacLog)) window.isaacLog.push(String(line));
+};
+const modUpdates = params.get('modupdate') === '0' || params.get('mods') === '0' || !modCatalogue ? null
+  : createModUpdater({ catalogueBase: modCatalogue, store: packStore, log: modUpdateLog });
+if (modUpdates) {
+  hooks.modUpdates = modUpdates;
+  hooks.modUpdateWaitMs = Number(params.get('modupdatewait') || 2500);
+  hooks.modUpdateLines = () => { const held = modUpdateLines || []; modUpdateLines = null; return held; };
+  modUpdates.start();
+}
 const modsMenu = createModsMenu({
   paper: modsPaper,
   browser: modBrowser,
+  store: packStore,
+  packs: packDownloader,
+  updates: modUpdates,
   log: (line) => console.log(line),
   catalogueBase: params.get('catalogue') || (typeof window !== 'undefined' ? window.isaacModCatalogue : null) || null,
   onInstalled: enableModsInOptions,
@@ -904,6 +1070,114 @@ const modsTag = createMenuTag({
 });
 const modsBrowsable = () => !!(params.get('catalogue') || (typeof window !== 'undefined' && window.isaacModCatalogue));
 const openModBrowser = () => { modsTag.setShown(false); modsMenu.open('browse'); };
+
+// ---- the game's debug console: a row of its OPTIONS list (rounds 124, 125) ----------------
+// The console is the game's own (the key left of 1, in a run) and the game keeps it off:
+// EnableDebugConsole in options.ini, which a player of the desktop game edits by hand and
+// a player here cannot. The OPTIONS list has no row for it -- but the game's own options
+// art has the word (OptionsExtra.png: a hand-lettered CONSOLE at 0,160, which no animation
+// of OptionsMenu.anm2 draws), and the list has a row that means nothing here: STREAMER MODE
+// (row id 22), which masks other players' names in online play. So that row becomes the
+// console's, natively:
+//   its name   The menu draws a row by playing the animation of that name in its sprite
+//              (Render 0x009b31c0). The page rewrites two frames of the loaded "StreamerMode"
+//              animation, in the game's memory: the name layer's crop moves from the words
+//              STREAMER MODE to the word CONSOLE, and the cursor moves in beside the shorter
+//              word. The game then draws the row itself -- its lettering, its ON/OFF, its
+//              cursor, its filter -- and scrolls, selects and toggles it as any other row.
+//   its value  The row toggles Options.StreamerMode; the page keeps Options.EnableDebugConsole
+//              equal to it (boot_web.mjs isaacOption), the console's byte being the one that
+//              counts at a start. Console::Update reads that byte every frame, so the row
+//              takes effect at once, and the stored options.ini line is rewritten so the
+//              choice survives a reload whether or not the game saved its options.
+// Off until asked for: an open console redraws its whole backlog every frame. A new save
+// keeps earning with it on (the lift patch at 0x00959618). Typing needs keys, so on a
+// touch-only device the row is left as the game has it.
+// Round 124 had a hint paper beside the screen and the C key instead; the row replaces both.
+//
+// Where things are (each read from the binary and then from the running game): the main
+// menu's options object is MenuManager+0xcecc, its selected row +0x8, its sprite (an ANM2)
+// +0x24; a sprite's animation table is at +0x74 and its count at +0x78; an animation is
+// 0x13c bytes -- its name (a std::string) first, its layer array at +0x18, the layer count
+// at +0x1c; a layer is 0x10 bytes -- its id, its frame array at +4, the frame count at +8;
+// a frame begins with ten floats: crop x, crop y, width, height, x, y, scale x, scale y,
+// pivot x, pivot y. The values below are OptionsMenu.anm2's own, as they stand in memory.
+const OPTIONS_SCREEN = 10;
+const MENU_OPTIONS_OFF = 0xcecc, OPTIONS_SPRITE_OFF = 0x24;
+const CONSOLE_ROW_ANIM = 'StreamerMode';
+const CONSOLE_ROW_FRAMES = [
+  { layer: 13, was: [128, 64, 112, 16, -54, 19, 1, 1, 16, 16], now: [0, 160, 96, 32, -38, 12, 1, 1, 16, 16] },   // the name
+  { layer: 5, was: [235, 24, 18, 22, -69, 18, 1, 1, 16, 16], now: [235, 24, 18, 22, -57, 17, 1, 1, 16, 16] },     // the cursor
+];
+const consoleUsable = !(coarsePointer || params.get('touch') === '1');
+const consoleOn = () => !!(window.isaacOption && window.isaacOption.get('console'));
+async function storeConsoleOption(on) {
+  const db = await openStore();
+  if (!db) return 'no store';
+  const cur = await new Promise((resolve) => {
+    try { const req = db.transaction(SAVE_STORE, 'readonly').objectStore(SAVE_STORE).get(OPTIONS_KEY); req.onsuccess = () => resolve(req.result || null); req.onerror = () => resolve(null); }
+    catch { resolve(null); }
+  });
+  if (!cur || !cur.bytes) return 'no options yet';
+  const text = new TextDecoder().decode(cur.bytes), next = setIniOption(text, 'EnableDebugConsole', on ? 1 : 0);
+  if (next === text) return 'kept';
+  await writeSaves(db, [{ key: OPTIONS_KEY, src: cur.src || null, bytes: new TextEncoder().encode(next) }], false);
+  return 'written';
+}
+const guestFloats = (G, va, n) => { const u = new Uint32Array(n); for (let i = 0; i < n; i++) u[i] = G.u32(va + i * 4); return Array.from(new Float32Array(u.buffer)); };
+// The row's name, in the sprite the menu has loaded now. The table's address is remembered:
+// a menu built again (after a run) loads its sprite again, and is looked at again. Nothing
+// is written unless both frames hold exactly the game's own values (or already the new ones).
+let rowTable = 0, rowState = 'waiting';
+function relabelConsoleRow() {
+  const G = window.isaacGuest;
+  if (!G || typeof G.swapFloats !== 'function') return rowState;
+  let mgr = 0;
+  try { mgr = G.u32(MENU_MGR_PTR); } catch { return rowState; }
+  if (!mgr) return rowState;
+  const sprite = mgr + MENU_OPTIONS_OFF + OPTIONS_SPRITE_OFF;
+  const table = G.u32(sprite + 0x74), count = G.u32(sprite + 0x78);
+  if (!table || table === rowTable || count < 1 || count > 256) return rowState;
+  rowTable = table;
+  rowState = 'no such row';
+  for (let i = 0; i < count; i++) {
+    const anim = table + i * 0x13c;
+    if (guestString(G, anim) !== CONSOLE_ROW_ANIM) continue;
+    const layers = G.u32(anim + 0x18), n = Math.min(G.u32(anim + 0x1c), 64);
+    const found = CONSOLE_ROW_FRAMES.map((f) => {
+      for (let k = 0; k < n; k++) {
+        const layer = layers + k * 0x10;
+        if (G.u32(layer) === f.layer && G.u32(layer + 8) >= 1) return G.u32(layer + 4);
+      }
+      return 0;
+    });
+    const have = found.map((va) => (va ? guestFloats(G, va, 10) : null));
+    const plan = rowFramesState(have, CONSOLE_ROW_FRAMES);
+    if (plan === 'differs') { rowState = 'not the frames expected'; break; }
+    const done = CONSOLE_ROW_FRAMES.map((f, k) => G.swapFloats(found[k], f.was, f.now));
+    rowState = done.every((r) => r === 'swapped' || r === 'already') ? 'console' : 'not the frames expected';
+    break;
+  }
+  if (rowState === 'console') console.log('[isaac] OPTIONS: the STREAMER MODE row is the debug console\'s (CONSOLE), in the game\'s own lettering');
+  else console.warn(`[isaac] OPTIONS: the console row was not set up (${rowState}); the list is left as the game has it`);
+  return rowState;
+}
+// The row's value and the console's switch, kept equal (menu_overlay.mjs consoleRowStep
+// decides: the row at first sight takes the console's value; afterwards whichever of the
+// two changed is followed, and a change made on the row is stored).
+const rowSeen = { seen: false, console: false, row: false };
+function syncConsoleRow() {
+  const O = window.isaacOption;
+  if (!O) return;
+  const step = consoleRowStep(rowSeen, O.get('console'), O.get('streamer'));
+  if (step.write) O.set(step.write.name, step.write.value);
+  if (step.store === null) return;
+  console.log(`[isaac] debug console ${step.store ? 'on: the key left of 1 opens it in a run' : 'off'}`);
+  storeConsoleOption(step.store).then((r) => { if (r !== 'written' && r !== 'kept') console.warn(`[isaac] the debug console choice was not stored (${r})`); })
+    .catch((e) => console.warn('[isaac] the debug console choice was not stored:', e.message));
+}
+const tendConsoleRow = () => { if (consoleUsable && gameReady && relabelConsoleRow() === 'console') syncConsoleRow(); };
+window.isaacConsoleRow = { state: () => rowState, on: consoleOn, tend: tendConsoleRow };   // the drivers look at it
 
 // ---- a controller in the page's own menus ------------------------------------------------
 // The game reads the pad itself (XInput, boot_web.mjs). The page's own papers --
@@ -1322,6 +1596,21 @@ try {
     try { localStorage.setItem('isaac-vsync-once', '1'); } catch { /* no storage */ }
   }
 } catch (e) { console.warn('[isaac] could not turn VSync on:', e.message); }
+
+// ---- mods: off on request, and a question after a boot that never arrived (round 101)
+try {
+  if (params.get('mods') === '0') {
+    const n = await turnModsOff();
+    console.log(`[isaac] ?mods=0: starting without mods (${n} turned off; they stay installed)`);
+  } else {
+    const on = await modsThatAreOn();
+    let unfinished = false;
+    try { unfinished = !!localStorage.getItem(BOOT_MARK); } catch { /* no storage */ }
+    if (on.length && unfinished && params.get('modsask') !== '0') await askAboutLastBoot(on);
+    // set for this boot; readiness (the first real picture) clears it
+    try { if (on.length) localStorage.setItem(BOOT_MARK, String(Date.now())); else localStorage.removeItem(BOOT_MARK); } catch { /* no storage */ }
+  }
+} catch (e) { console.warn('[isaac] could not check the last boot:', e.message); }
 
 // ---- go: the pipeline runs to the end of main; this import resolves when it does
 setStatus('loading');

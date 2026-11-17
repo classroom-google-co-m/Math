@@ -22,12 +22,19 @@ Two shapes:
            spread over several scripts: V8 will not compile a source longer than
            about 512 MB and says nothing when it declines.
 
-Neither build changes the engine or the module: the page takes its bytes from
+  svg      the offline build as one .svg (round 126): the payload in the SVG's own
+           scripts, and the page in an iframe it hands the page to as srcdoc (see
+           cmd_svg). Opened directly, it plays like the .html; as an <img> it shows
+           nothing, since an image runs no script.
+
+No build changes the engine or the module: the page takes its bytes from
 `window.isaacPortable` instead of a server (play.mjs, round 70).
 
 usage:
   portable.py chunks  <dist> <out-dir> [--base URL] [--chunks 12] [--skip videos.a]
   portable.py offline <dist> <out.html>             [--piece-mib 8] [--skip videos.a]
+  portable.py svg     <dist> <out.svg>              [--piece-mib 4] [--skip videos.a]
+  portable.py svg-wrap <chunked page.html> <out.svg>  (a half-megabyte .svg that fetches the chunks)
 """
 from __future__ import annotations
 
@@ -1297,6 +1304,164 @@ def cmd_offline(args) -> int:
     return 0
 
 
+# ---- svg: the offline build as one .svg -------------------------------------------
+# A browser opens an .svg as a document of its own (image/svg+xml), parsed as XML,
+# and runs its <script> elements. The page itself cannot live in it: an SVG document
+# makes null-namespace elements from createElement and parses innerHTML as XML. So
+# the .svg holds the payload and an iframe, and hands the iframe the page as srcdoc.
+# An srcdoc document is a real HTML document that shares the .svg's origin, so the
+# page runs unchanged, reads the payload from its parent (window.__isaacPortableData
+# is the parent's object, not a copy), and keeps its saves where a page from the same
+# folder keeps them. Its location is about:srcdoc, so the page resolves relative URLs
+# against document.baseURI (the .svg's), and it has no query string of its own.
+#
+# The XML rules: no text node may hold "]]>" inside its CDATA (split where it occurs),
+# no control character may appear (json.dumps escapes them), and each script is kept
+# under libxml2's 10,000,000-byte text-node limit (it is not lifted for an SVG), which
+# is why the pieces are 4 MiB here: one piece is one script of 5.6 MB of base64.
+SVG_TEXT_MAX = 10_000_000
+SVG_FRAME_JS = r"""
+(function () {
+  var f = document.getElementById('game'), wait = document.getElementById('wait');
+  f.addEventListener('load', function () {
+    if (wait) wait.setAttribute('display', 'none');
+    try { f.contentWindow.focus(); } catch (e) { /* not ours */ }
+  });
+  // a click anywhere on the picture gives the game the keyboard
+  document.documentElement.addEventListener('pointerdown', function () { try { f.contentWindow.focus(); } catch (e) {} });
+  f.srcdoc = window.__isaacSvgPage;
+})();
+"""
+
+
+def cdata(text: str) -> str:
+    """`text` as one CDATA section: a "]]>" in it ends one section and begins the next."""
+    return "<![CDATA[" + text.replace("]]>", "]]]]><![CDATA[>") + "]]>"
+
+
+def svg_script(js: str) -> str:
+    body = cdata(js)
+    if len(body) > SVG_TEXT_MAX:
+        raise SystemExit("svg: a script of %d bytes is over the XML parser's %d-byte text limit" % (len(body), SVG_TEXT_MAX))
+    return '<script type="text/javascript">' + body + "</script>\n"
+
+
+def svg_page(dist: str, args) -> str:
+    """The page the iframe is handed: the offline page with the payload left in the parent."""
+    html = page_source(dist).replace('<script type="module" src="./play.mjs"></script>', "")
+    mods = {rel: read(os.path.join(dist, rel)).decode("utf-8") for rel in MODULES}
+    tail = ("<script>window.__isaacPortableData = parent.__isaacPortableData;</script>\n"
+            + catalogue_script(args)
+            + "<script>" + RECIPE_JS + PROVIDER_JS + "</script>"
+            + "\n<script>window.__isaacModules = " + json.dumps(mods) + ";</script>\n"
+            + "<script>" + MODULE_LOADER_JS + "</script>")
+    return inject_at_end(html, tail)
+
+
+def svg_head(page: str) -> str:
+    """The .svg's opening: its title (the page's), the loading line, and the iframe the page goes into."""
+    m = re.search(r"<title>(.*?)</title>", page, re.S)
+    title = (m.group(1).strip() if m else "") or "The Binding of Isaac"
+    title = title.replace("&", "&amp;").replace("<", "&lt;")
+    return ('<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<svg xmlns="http://www.w3.org/2000/svg" width="100%" height="100%">\n'
+            "<title>" + title + "</title>\n"
+            "<style>:root { background: #000; } svg { display: block; }</style>\n"
+            '<text id="wait" x="50%" y="50%" fill="#ccc" text-anchor="middle" font-family="sans-serif" font-size="16">'
+            "Loading the game into this page...</text>\n"
+            '<foreignObject x="0" y="0" width="100%" height="100%">'
+            '<iframe xmlns="http://www.w3.org/1999/xhtml" id="game" title="game" allow="fullscreen; autoplay; gamepad" '
+            'allowfullscreen="" style="border:0;width:100%;height:100%;display:block;background:#000"></iframe>'
+            "</foreignObject>\n")
+
+
+def cmd_svg(args) -> int:
+    files = plan(args.dist, set(args.skip or []))
+    whole, windowed = split_parts(files)
+    table = {}
+    a_len = lay_out(whole, table, 0)
+    b_len = lay_out(windowed, table, 1, WINDOW)
+    piece = args.piece_mib * MIB
+    if (piece + 2) // 3 * 4 + 64 > SVG_TEXT_MAX:
+        raise SystemExit("svg: --piece-mib %d makes scripts over the XML parser's text limit; 6 is the most" % args.piece_mib)
+    page = svg_page(args.dist, args)
+    out = os.path.abspath(args.out)
+    os.makedirs(os.path.dirname(out), exist_ok=True)
+    stored = []
+    with open(out, "w", encoding="utf-8", newline="\n") as f:
+        f.write(svg_head(page))
+        f.write(svg_script("window.__isaacPortableData = { blobs: [] };"))
+
+        def emit(_i, b):
+            stored.append(len(b))
+            f.write(svg_script('window.__isaacPortableData.blobs.push("' + base64.b64encode(b).decode("ascii") + '");'))
+
+        n_a = cut(whole, piece, emit)
+        n_b = cut(windowed, piece, emit)
+        streams = [{"tag": "a", "size": piece, "gz": False, "n": n_a, "first": 0,
+                    "bytes": a_len, "stored": stored[:n_a]},
+                   {"tag": "b", "size": piece, "gz": False, "n": n_b, "first": n_a,
+                    "bytes": b_len, "stored": stored[n_a:]}]
+        data = {"streams": streams, "files": table, "base": None,
+                "index": index_for(args.dist, files), "manifest": manifest_for(args.dist, files),
+                "status": "loading"}
+        f.write(svg_script("Object.assign(window.__isaacPortableData, " + json.dumps(data, separators=(",", ":")) + ");"))
+        f.write(svg_script("window.__isaacSvgPage = " + json.dumps(page) + ";"))
+        f.write(svg_script(SVG_FRAME_JS))
+        f.write("</svg>\n")
+    print("svg: %s (%s), %s of payload in %d pieces, one script each"
+          % (out, human(os.path.getsize(out)), human(a_len + b_len), n_a + n_b))
+    return 0
+
+
+# ---- svg-wrap: a chunked page as a small .svg ---------------------------------------
+# The chunked build's page (cmd_chunks, or a release's GitHub Pages page) carries no
+# payload: it fetches its chunks from absolute URLs (jsDelivr). Wrapped the same way as
+# cmd_svg wraps its page, it is an .svg of half a megabyte that plays from a disk or from
+# any host that serves an .svg, fetching the game as the page does. What it needs of the
+# page: a payload that lives at absolute URLs (an srcdoc has no folder of its own to fetch
+# a relative one from), and modules from round 126 on (they resolve their own URLs against
+# document.baseURI; older ones throw on about:srcdoc in their first line).
+SVG_WRAP_NEEDS = "document.baseURI"
+
+
+def svg_wrap_page(html: str) -> str:
+    """Check that a built page can run as an srcdoc, and return it."""
+    m = re.search(r"window\.__isaacPortableData\s*=\s*", html)
+    if not m:
+        raise SystemExit("svg-wrap: the page carries no portable data (window.__isaacPortableData)")
+    data, _ = json.JSONDecoder().raw_decode(html, m.end())
+    if data.get("blobs") is not None or html.find("__isaacPortableData.blobs.push(") >= 0:
+        raise SystemExit("svg-wrap: this is an offline page (the payload is inline); build it with `svg` instead")
+    bases = [s.get("base") for s in data.get("streams", [])] + [data.get("base")]
+    for b in bases:
+        if b is not None and not re.match(r"https?://", b):
+            raise SystemExit("svg-wrap: the payload is at %r, relative to the page; an .svg has no folder of its own "
+                             "to fetch it from (build the page with an absolute --base)" % b)
+    i = html.find("window.__isaacModules = ")
+    if i < 0:
+        raise SystemExit("svg-wrap: the page carries no modules (window.__isaacModules)")
+    mods, _ = json.JSONDecoder().raw_decode(html, i + len("window.__isaacModules = "))
+    for name in ("play.mjs", "boot_web.mjs"):
+        if SVG_WRAP_NEEDS not in mods.get(name, ""):
+            raise SystemExit("svg-wrap: the page's %s predates round 126 (no %s): in an srcdoc its first relative "
+                             "URL throws; build the page from round 126's modules" % (name, SVG_WRAP_NEEDS))
+    return html
+
+
+def cmd_svg_wrap(args) -> int:
+    page = svg_wrap_page(read(args.page).decode("utf-8"))
+    out = os.path.abspath(args.out)
+    os.makedirs(os.path.dirname(out), exist_ok=True)
+    with open(out, "w", encoding="utf-8", newline="\n") as f:
+        f.write(svg_head(page))
+        f.write(svg_script("window.__isaacSvgPage = " + json.dumps(page) + ";"))
+        f.write(svg_script(SVG_FRAME_JS))
+        f.write("</svg>\n")
+    print("svg-wrap: %s (%s) from %s" % (out, human(os.path.getsize(out)), args.page))
+    return 0
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -1342,6 +1507,18 @@ def main(argv=None) -> int:
     p.add_argument("--catalogue", help="where modpack.py's catalogue is served from; without one the "
                                        "page offers no MOD BROWSER row")
     p.set_defaults(fn=cmd_offline)
+    p = sub.add_parser("svg")
+    p.add_argument("dist"); p.add_argument("out")
+    p.add_argument("--piece-mib", type=int, default=4, help="inline piece size; each piece is one script, "
+                                                             "under the XML parser's 10 MB text limit (6 at most)")
+    p.add_argument("--skip", nargs="*", help="archive file names to leave out")
+    p.add_argument("--catalogue", help="where modpack.py's catalogue is served from; without one the "
+                                       "page offers no MOD BROWSER row")
+    p.set_defaults(fn=cmd_svg)
+    p = sub.add_parser("svg-wrap")
+    p.add_argument("page", help="a chunked build's page (index.html) whose payload is at absolute URLs")
+    p.add_argument("out")
+    p.set_defaults(fn=cmd_svg_wrap)
     args = ap.parse_args(argv)
     if getattr(args, "key_of", None) and not args.key_b64:
         page = read(args.key_of).decode("utf-8", "replace")

@@ -137,10 +137,27 @@ extern "C" {
 #define ISAAC_GUARD_SIZE      0x00100000u
 #define ISAAC_HOST_BASE_VA    0x1c000000u       /* -sGLOBAL_BASE=469762048     */
 
+/* Round 101: the guest heap's overflow segments (host_shims_heap.c). When the
+ * arena below the limit is full, the allocator takes a segment from the host's
+ * own, growable heap and hands the guest blocks out of it -- above the guard,
+ * which THE RULE above forbade for good reason and which is still better than
+ * the alternative: the arena is committed with the wasm memory and was sized
+ * to the boot's peak (round 69: 384 MiB against 350 measured), so a long run
+ * or a mod with a large Lua heap got NULL from malloc and the game died on it.
+ * A segment is guest memory in every sense but its address, so a pointer into
+ * one has to pass the check below. Weak, so every build links whether or not
+ * it carries the allocator; {lo, size} per segment. */
+#define ISAAC_OVF_MAX 16u
+__attribute__((weak)) uint32_t g_isaac_ovf_n;
+__attribute__((weak)) uint32_t g_isaac_ovf[ISAAC_OVF_MAX][2];
+
 /* True if `va` is somewhere the guest is allowed to touch. Host code uses this
  * to reject a guest-supplied pointer before dereferencing it. */
 static inline int isaac_is_guest_va(uint32_t va) {
-    return va < ISAAC_GUEST_LIMIT_VA;
+    if (va < ISAAC_GUEST_LIMIT_VA) return 1;
+    for (uint32_t i = 0; i < g_isaac_ovf_n; ++i)
+        if (va - g_isaac_ovf[i][0] < g_isaac_ovf[i][1]) return 1;
+    return 0;
 }
 
 /* ------------------------------------------------------- guest accessors -- */
@@ -350,6 +367,9 @@ int  isaac_glc_rb_param(uint32_t pname, uint32_t *out);
 void isaac_glc_tex_active(uint32_t unit);
 void isaac_glc_tex_bind(uint32_t target, uint32_t name);
 void isaac_glc_tex_image(uint32_t target);
+void isaac_glc_tex_shape(uint32_t target, uint32_t level, uint32_t ifmt, uint32_t w, uint32_t h);   /* round 118 */
+void isaac_glc_fbo_shape_mode(int on);
+uint32_t isaac_glc_fbo_shape_hits(void);
 void isaac_glc_tex_delete(uint32_t name);
 void isaac_glc_fbo_bind(uint32_t target, uint32_t name);
 void isaac_glc_fbo_attach(uint32_t target, uint32_t attachment, uint8_t kind, uint32_t name, uint32_t extra);
@@ -434,6 +454,13 @@ int    isaac_lazy_tex_materialize(uint32_t name, isaac_lazy_upload_fn up);
 void   isaac_lazy_tex_stats(uint32_t *pending, uint32_t *deferred, uint32_t *materialized, uint32_t *refused,
                             uint64_t *held, uint64_t *raw_pending);
 void   isaac_lazy_tex_report(void);
+/* round 118: an image the game's loader returned is kept past its last user (host_img_keep.c) */
+uint64_t isaac_gl_tex_image_bytes(void);
+void   isaac_img_keep_reset(uint64_t budget_bytes, double idle_ms);
+void   isaac_img_keep_counts(uint32_t out[6], uint64_t *bytes);
+int    isaac_img_keep_note(uint32_t img, uint64_t bytes, double now_ms,
+                           int (*hold)(void *, uint32_t), void (*drop)(void *, uint32_t), void *ctx);
+void   isaac_img_keep_report(void);
 
 /* host_snd_lazy.c (round 98): a sound sample's PCM is read when it is first
  * played. The lift patches in SampleSourceWav's loader (0x00a7b6a0) call

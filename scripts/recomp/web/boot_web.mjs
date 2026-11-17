@@ -8,7 +8,8 @@
 // module printed), isaacFrames (the last frames the host's SwapBuffers shim
 // read back from the WebGL framebuffer), isaacDone ({mainRc, bootRc, ...}).
 import Module from './boot.mjs';
-import { openModDb, seedMods, putModState, setModEnabled, underMods, isImportMark, disableTarget } from './mods.mjs';
+import { openModDb, seedMods, putModState, setModEnabled, underMods, isImportMark, disableTarget,
+         listMods, isPacked, createPackStore, createPackedMods, packedIndex, createPackDownloader, createModScan } from './mods.mjs';
 import { createPads, createPadGate, rumble } from './gamepad.mjs';
 
 const logEl = document.getElementById('log');
@@ -30,6 +31,31 @@ function log(line) {
   if (window.isaacLog.length % 50 === 0 || /RESULT|TRAP|frame\]/.test(line)) {
     logEl.textContent = window.isaacLog.slice(-12).join('\n');
   }
+}
+
+// Round 101: the cause of a stop, into the log a player can copy. The host's
+// isaac_log (host_trap.c) prints through console.warn so a line is not held
+// back until a newline, which means its lines were never in isaacLog: the
+// error panel and "Copy log" showed the game's last lines and the closing
+// report, and not the one line that said why -- `[isaac][TRAP] ...`,
+// `[isaac] reason: ...`, a throw nothing caught, an allocation that failed.
+// Two bug reports arrived that way with nothing to go on. Only the lines that
+// name a stop are taken (the routine ones would bury the game's own log), and
+// the out-of-memory line only its first few times.
+const STOP_LINE = /\[isaac\]\[TRAP\]|\[isaac\] =+ STOPPING|\[isaac\] reason:|\[isaac\]\[c\+\+\] (?:throw of \S+ from \S+: no catch|_CxxThrowException|the catch at|__RTDynamicCast)|\[isaac\]\[crt\] (?:_?exit\(|abort\(|std::terminate|ASSERTION|_invalid_parameter)|\[isaac\]\[k32\] (?:UnhandledExceptionFilter|TerminateProcess|WaitForSingleObject| +code 0x| +EXCEPTION_POINTERS)|\[isaac\]\[heap\] (?:OUT OF MEMORY|double free)|\[isaac\]\[lua\] .*(?:exhausted|deeper)/;
+let oomLines = 0;
+if (typeof console !== 'undefined' && !console.__isaacWarn) {
+  const warn0 = console.warn.bind(console);
+  console.warn = (...args) => {
+    warn0(...args);
+    try {
+      const s = typeof args[0] === 'string' ? args[0] : '';
+      if (!s || !STOP_LINE.test(s)) return;
+      if (/OUT OF MEMORY/.test(s) && ++oomLines > 4) return;
+      for (const l of s.split('\n')) log(l);
+    } catch (e) { /* the log never stops the game */ }
+  };
+  console.__isaacWarn = true;
 }
 
 // Synchronous binary fetch: the RAM-FS asks for lazy bytes from inside a
@@ -101,13 +127,27 @@ if (typeof window.addEventListener === 'function') {
   window.addEventListener('gamepaddisconnected', (e) => { pads.wake(); log(`[pad] ${e.gamepad.id} disconnected`); });
 }
 let lazyReads = 0, lazyBytes = 0;
+// round 107: the packed mods of this boot (mods.mjs createPackedMods), set up by 'register packed mods'
+let packedMods = null, packStore = null;
+// round 108: the background download of every pack of them (play.mjs's, or one of its own here)
+let packDownloader = null;
+const background = () => packDownloader || hooks.packDownloader || null;
 const lazyByFile = new Map();                              // src -> bytes (round 40: what the run start reads)
 const preadTrail = [];                                    // the first window offsets, in order (scan or thrash?)
 const preadStacks = [];                                   // three wasm stacks under a window fetch: who reads the archive?
-window.isaacLazyStats = () => ({ reads: lazyReads, bytes: lazyBytes, windows: preads, windowBytes: preadBytes, distinctWindows: windowsSeen.size, trail: preadTrail.slice(0, 60), stacks: preadStacks,
+window.isaacLazyStats = () => ({ packed: packedMods ? Object.assign({ store: packStore.stats }, packedMods.stats, packedMods.held()) : null,
+  background: background() ? background().stats() : null, reads: lazyReads, bytes: lazyBytes, windows: preads, windowBytes: preadBytes, distinctWindows: windowsSeen.size, trail: preadTrail.slice(0, 60), stacks: preadStacks,
   prefetched, prefetchHits, prefetchMisses, aheadFetched, readerWaits, readerWaitMs: Math.round(readerWaitMs), reader: !!reader, trailKept, trailShipped, trailLen: trail.length, trailWritten,
   top: [...lazyByFile].sort((a, b) => b[1] - a[1]).slice(0, 6).map(([k, v]) => `${k.replace(/^.*\//, '')} ${(v / 1048576).toFixed(1)} MB`) });
 cfg.isaacLazyRead = (src, dst, len) => {
+  // round 107: a packed mod's file is read in place (isaacLazyPread); an engine
+  // that asks for one whole can only have it if it is at hand
+  if (packedMods && packedMods.owns(src)) {
+    const b = packedMods.readNow(src);
+    if (b && b.length >= len) { m.HEAPU8.set(b.subarray(0, len), dst); lazyReads += 1; lazyBytes += len; return 1; }
+    log(`  lazy read FAILED for ${src}: a packed mod's file asked for whole (this engine has no ranged reads)`);
+    return 0;
+  }
   try {
     const bytes = fetchSync(`/instance/${src}`);
     if (bytes.length < len) { log(`  lazy read of ${src}: ${bytes.length} bytes served, ${len} registered`); return 0; }
@@ -593,12 +633,16 @@ const armTrail = (jobs) => {
 const pendingReads = new Map();                           // id -> { src, off, len, dst, resolve, t0 }
 const lazySizes = new Map();                              // src -> bytes (the instance index): read-ahead stops at a file's end
 const lastRead = new Map();                               // src -> the last window offset: read-ahead follows a sequential file
+// What a relative URL is resolved against: the document's base URL, which is the page's
+// own URL on a served page and the .svg's in the .svg build, whose page is an iframe's
+// srcdoc (location about:srcdoc, against which nothing resolves).
+const pageBase = () => document.baseURI;
 const windowUrl = (src, off, len) => {
   let url = `/instance/${src}?off=${off}&len=${len}`;
   if (hooks.url) url = hooks.url(url);
   // round 70: a portable build answers null when it has no URL for a window -- the
   // caller reads the bytes instead of asking a server that is not there
-  return url === null ? null : new URL(url, location.href).href;
+  return url === null ? null : new URL(url, pageBase()).href;
 };
 function finishRead(src, off, dst, bytes) {
   m.HEAPU8.set(bytes, dst);
@@ -676,7 +720,7 @@ function startReader() {
       armTrail(jobs);
       return;
     }
-    fetch(new URL(url, location.href).href).then((r) => (r.ok ? r.json() : null)).then((shipped) => {
+    fetch(new URL(url, pageBase()).href).then((r) => (r.ok ? r.json() : null)).then((shipped) => {
       if (!Array.isArray(shipped) || !shipped.length || reader !== w) return;
       trailKept = shipped.length; trailShipped = true;
       armTrail(shipped.map(([src, off, len]) => [`${src}@${off}@${len}`, windowUrl(src, off, len), len]));
@@ -735,6 +779,16 @@ window.isaacRunTrail = () => ({ recording: runRecording, recorded: runRecorded, 
 startReader();
 window.addEventListener('pagehide', () => { writeTrail(); saveRunTrail(); if (reader) reader.terminate(); });   // a short visit still leaves its trail
 cfg.isaacLazyPread = (src, dst, off, len) => {
+  // round 107: a packed mod's file -- the header blob or a pack at hand answers
+  // now, anything else suspends the read until its pack is here
+  if (packedMods && packedMods.owns(src)) {
+    const put = (b) => { m.HEAPU8.set(b, dst); return b.length; };
+    try {
+      const got = packedMods.pread(src, off, len);
+      if (got && typeof got.then === 'function') return got.then(put, (e) => failRead(src, off, len, e.message));
+      return put(got);
+    } catch (e) { return failRead(src, off, len, e.message); }
+  }
   try {
     if (!trailWritten && trail.length < TRAIL_MAX) trail.push([src, off, len]);
     // after the boot, until the first run has played a while: the run's windows
@@ -800,6 +854,9 @@ cfg.isaacWantsFrame = (n) => {
   // Worker drops the windows it fetched ahead and never handed over (up to the
   // 128 MB budget -- ~80 MB of the renderer's working set) and keeps 8 MB of
   // read-ahead for play; the trail's leftovers go with them
+  if (n === READER_CLEAR_FRAME && packedMods) packedMods.release();   // round 107: the eager lane has done its work
+  // round 108: the boot's own reads are done: the rest of the packed mods comes in two at a time
+  if (n === READER_CLEAR_FRAME && packedMods && packDownloader) packDownloader.pace(0);
   if (n === READER_CLEAR_FRAME && reader && !runArmed) { reader.postMessage({ clear: true, budget: READER_PLAY_BUDGET }); trailJobs = null; }
   // the same moment for the portable page's cached whole-read chunks (stream A: the
   // engine, the image, the eagerly seeded archives), spent once the boot is over
@@ -1078,6 +1135,47 @@ window.isaacGuest = {
     return (H[va] | (H[va + 1] << 8) | (H[va + 2] << 16) | (H[va + 3] << 24)) >>> 0;
   },
 };
+// Two of the game's option bytes, for the CONSOLE row of its OPTIONS screen (play.mjs,
+// round 125). Both live in the Options block inside the Manager (at [0x00c7169c]):
+//   console   Manager+0x2a398  Options.EnableDebugConsole. The game's Lua property
+//             Options.DebugConsoleEnabled is this byte and nothing else (getter 0x00897360:
+//             `mov eax,[0xc7169c]; mov al,[eax+0x2a398]; ret`; setter 0x00897370 stores the
+//             argument's low byte there), and Console::Update (0x0068b260) reads it every
+//             frame, so a change takes effect at once.
+//   streamer  Manager+0x2a3e0  Options.StreamerMode: what the OPTIONS row with id 22 toggles
+//             (0x009b2f07 / 0x009b2f11 in the menu's Update) and shows (0x009b42c5 in its
+//             Render). Its one other reader, 0x0090f700, masks a player's name in online play.
+// OptionsConfig::Save (0x00924d10) writes both back. Only these two can be asked for.
+// null / false: the game is not up yet.
+const MANAGER_PTR = 0x00c7169c;
+const OPTION_BYTES = { console: 0x2a398, streamer: 0x2a3e0 };
+const optionByte = (name) => {
+  const off = Object.prototype.hasOwnProperty.call(OPTION_BYTES, name) ? OPTION_BYTES[name] : 0;
+  const H = m && m.HEAPU8, mgr = H && off ? window.isaacGuest.u32(MANAGER_PTR) : 0;
+  return mgr && mgr + off < H.length ? mgr + off : 0;
+};
+window.isaacOption = {
+  get: (name) => { const at = optionByte(name); return at ? m.HEAPU8[at] !== 0 : null; },
+  set: (name, on) => { const at = optionByte(name); if (!at) return false; m.HEAPU8[at] = on ? 1 : 0; return true; },
+};
+// the console's switch by itself, as the drivers and the round-124 page knew it
+window.isaacDebugConsole = { get: () => window.isaacOption.get('console'), set: (on) => window.isaacOption.set('console', on) };
+// Guest memory is otherwise read-only to the page. This is the one way to write it: a
+// run of 32-bit floats is replaced only if every one of them holds the value the caller
+// expects (or already holds the new one), so a page that has the wrong address, or a game
+// build laid out differently, changes nothing. 'swapped' | 'already' | 'differs' | 'unmapped'.
+window.isaacGuest.swapFloats = (va, expect, next) => {
+  const H = m && m.HEAPU8;
+  va >>>= 0;
+  if (!H || !Array.isArray(expect) || !Array.isArray(next) || expect.length !== next.length || !expect.length || expect.length > 16
+    || va < 0x10000 || va + expect.length * 4 > H.length) return 'unmapped';
+  const view = new DataView(H.buffer, H.byteOffset + va, expect.length * 4);
+  const have = expect.map((_, i) => view.getFloat32(i * 4, true));
+  if (have.every((v, i) => v === Math.fround(next[i]))) return 'already';
+  if (!have.every((v, i) => v === Math.fround(expect[i]))) return 'differs';
+  next.forEach((v, i) => view.setFloat32(i * 4, v, true));
+  return 'swapped';
+};
 // The guest heap's high-water report on demand, into the log like the one at
 // exit: a long session's peak against the arena without ending the session.
 window.isaacHeapReport = () => { try { m._isaac_heap_report(); return true; } catch (e) { return false; } };
@@ -1209,6 +1307,16 @@ try {
   // where its bytes land.
   await stageOk('seed mods', async () => {
     if (!modsOn) { log('  mods=0: no mods, and no import row'); return 0; }
+    // round 116: the page's check of the installed mods against the catalogue (play.mjs,
+    // mods.mjs createModUpdater) is waited for here, up to a cap; whatever it writes
+    // after this waits until the mods are read (afterSeed below), for the next start
+    if (hooks.modUpdates) {
+      const w = await hooks.modUpdates.beforeSeed(hooks.modUpdateWaitMs == null ? 2500 : hooks.modUpdateWaitMs);
+      for (const line of hooks.modUpdateLines ? hooks.modUpdateLines() : []) log(line);
+      const s = hooks.modUpdates.stats();
+      log(`  catalogue check: ${s.state}${w.done ? '' : ' (not finished: what is left is for the next start)'}, waited ${Math.round(w.waitedMs)} ms here; `
+        + `${s.fetches} request(s), ${s.refreshed} updated, ${s.same} the same`);
+    }
     try { modDb = await openModDb(); } catch (e) { log(`  mod store unavailable: ${e.message}`); modDb = null; }
     // Round 85: a mod's Lua is opened by the host Lua's own libc, which reads
     // through MEMFS -- the same reason the game's own scripts are copied there
@@ -1237,23 +1345,92 @@ try {
     // and the browser adds a .zip too, so the IMPORT MOD row would be a second way
     // in to the same place: it is seeded only where there is no browser.
     const modBrowser = !!(params.get('catalogue') || window.isaacModCatalogue);
-    const r = await seedMods(modDb, seed, log, { sentinel: !modBrowser });
+    // round 122: the mods' Lua is read for what it says about REPENTOGON as it is seeded
+    // (mods.mjs createModScan); ?modscan=0 leaves the layer with its own short list
+    const r = await seedMods(modDb, seed, log, { sentinel: !modBrowser, scan: params.get('modscan') === '0' ? null : createModScan() });
     log(`  ${r.mods} mod(s), ${r.files} file(s), ${(r.bytes / 1048576).toFixed(2)} MB`
       + (r.off ? `, ${r.off} off` : '') + (r.state ? `, ${r.state} state file(s)` : '')
       + (r.skipped ? `, ${r.skipped} skipped` : '')
       + (luaFiles ? `, ${luaFiles} lua into MEMFS` : ''));
     return r.files;
   });
+  // --- round 107: packed mods (a catalogue's large ones). Their files are registered
+  // by name and size and read in place: the engine asks isaacLazyRanged whether a
+  // lazy file is one, and its reads of it come to isaacLazyPread at its own
+  // offsets. Their Lua goes to MEMFS as any mod's does. The index and the eager
+  // lane come from the Cache API (fetched again if the browser cleared them).
+  await stageOk('register packed mods', async () => {
+    if (!modsOn || !modDb) return 0;
+    let list = [];
+    try { list = (await listMods(modDb)).filter((x) => x.enabled !== false && isPacked(x)); } catch (e) { log(`  packed mods: ${e.message}`); }
+    if (!list.length) return 0;
+    packStore = hooks.packStore || createPackStore({ log });
+    packDownloader = hooks.packDownloader !== undefined ? hooks.packDownloader
+      : params.get('packbg') === '0' ? null : createPackDownloader({ store: packStore, log });
+    let waitTimer = null;
+    packedMods = createPackedMods({
+      store: packStore,
+      // a read the game is waiting on for more than a moment is shown (play.mjs)
+      onWait: (pending) => {
+        if (!hooks.onModPackWait) return;
+        if (pending && !waitTimer) waitTimer = setTimeout(() => { waitTimer = null; if (packedMods.stats.pending) hooks.onModPackWait(true); }, 700);
+        if (!pending) { if (waitTimer) { clearTimeout(waitTimer); waitTimer = null; } hooks.onModPackWait(false); }
+      },
+    });
+    cfg.isaacLazyRanged = (src) => packedMods.owns(src);
+    let n = 0;
+    for (const mod of list) {
+      const t0 = performance.now();
+      try {
+        const index = await packedIndex(packStore, mod);
+        await packedMods.add(mod.id, mod.packed.base, index);
+        let files = 0, bytes = 0;
+        for (const [src, size] of packedMods.paths(mod.id)) {
+          const pp = cstr(src);
+          try { if (m._isaac_fs_seed_lazy(pp, size)) { files += 1; bytes += size; } } finally { m._free(pp); }
+        }
+        let lua = 0;
+        for (const [rel, body] of await packedMods.lua(mod.id)) {
+          const at = `/mods/${mod.id}/${rel}`;
+          m.FS.mkdirTree(at.slice(0, at.lastIndexOf('/')));
+          m.FS.writeFile(at, body);
+          lua += 1;
+        }
+        n += 1;
+        log(`  ${mod.name} (${mod.id}): ${files} file(s) registered, read in place (${(bytes / 1048576).toFixed(1)} MB), ${lua} lua into MEMFS, ${(performance.now() - t0).toFixed(0)} ms`);
+      } catch (e) {
+        packedMods.remove(mod.id);
+        log(`  ${mod.name} (${mod.id}): not loaded, ${e.message}`);
+      }
+    }
+    const st = packStore.stats;
+    log(`  packed mods: ${n} of ${list.length}; packs from the cache ${st.cacheHits}, fetched ${st.fetched} (${(st.fetchedBytes / 1048576).toFixed(1)} MB)`);
+    // round 108: the rest of them, in the background from here on -- one at a time
+    // while the game boots (its own reads come first), two once the boot is over
+    if (n && packDownloader) { packDownloader.pace(1); packDownloader.start().catch((e) => log(`[mods] the background download: ${e.message}`)); }
+    return n;
+  });
+  // round 116: the game has read its mods; an update from here on is for the next start
+  if (hooks.modUpdates) hooks.modUpdates.afterSeed();
+
   // --- the host Lua's libc reads scripts through MEMFS: put them there
   await stageOk('lua scripts into MEMFS', async () => {
-    let n = 0;
-    for (const { p: rel } of index) {
-      if (!rel.startsWith('resources/scripts/')) continue;
-      const dir = rel.slice(0, rel.lastIndexOf('/'));
-      m.FS.mkdirTree('/' + dir);
-      m.FS.writeFile('/' + rel, await fetchBytes(`/instance/${rel}`));
-      n += 1;
-    }
+    // Round 102: and a mod that is part of the instance tree itself (a dist made
+    // for working on a large mod, scripts/recomp/rgon/tools/dev_dist.py) has its
+    // Lua there for the same reason. Fiend Folio has 1,855 files of it, so these
+    // are fetched a few at a time rather than one after another.
+    const wanted = index.filter(({ p: rel }) => rel.startsWith('resources/scripts/') || (rel.startsWith('mods/') && /\.lua$/i.test(rel)));
+    let n = 0, next = 0;
+    const worker = async () => {
+      while (next < wanted.length) {
+        const rel = wanted[next++].p;
+        const bytes = await fetchBytes(`/instance/${rel.split('/').map(encodeURIComponent).join('/')}`);
+        m.FS.mkdirTree('/' + rel.slice(0, rel.lastIndexOf('/')));
+        m.FS.writeFile('/' + rel, bytes);
+        n += 1;
+      }
+    };
+    await Promise.all(Array.from({ length: wanted.length > 64 ? 12 : 1 }, worker));
     log(`  ${n} lua scripts written`);
     return n;
   });

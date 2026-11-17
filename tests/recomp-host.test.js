@@ -14,7 +14,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { existsSync, readFileSync, statSync, readdirSync } from 'node:fs';
+import { existsSync, readFileSync, statSync, readdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -739,6 +740,46 @@ test('Lua build script encodes the flags, and does not download', () => {
   assert.match(b, /does not download/);
 });
 
+test('Lua build script extracts a placed tarball where the builds look for lua.h', (t) => {
+  // Issue 21: the extraction named an undefined THIRD_PARTY and died with a
+  // NameError; build_selftest.py and build_boot.py read tools/lua-5.3.3/src.
+  const python = [process.env.PYTHON, 'python3', 'python'].find((p) =>
+    p && spawnSync(p, ['-c', 'import sys; print(sys.version_info[0])'],
+      { encoding: 'utf8', timeout: 10000 }).stdout?.trim() === '3');
+  if (!python) return t.skip('no Python 3 available');
+  const tmp = mkdtempSync(join(tmpdir(), 'lua-build-'));
+  t.after(() => rmSync(tmp, { recursive: true, force: true }));
+  const code = [
+    'import io, json, sys, tarfile',
+    'from pathlib import Path',
+    'sys.path.insert(0, sys.argv[1])',
+    'import lua_build as lb',
+    'tmp = Path(sys.argv[2])',
+    'with tarfile.open(tmp / "lua-5.3.3.tar.gz", "w:gz") as tf:',
+    '    data = b"#define LUA_VERSION_NUM 503"',
+    '    info = tarfile.TarInfo("lua-5.3.3/src/lua.h")',
+    '    info.size = len(data)',
+    '    tf.addfile(info, io.BytesIO(data))',
+    'lb.INPUT_DIR = tmp',
+    'lb.SRC_DIR = tmp / "lua-5.3.3"',
+    'lb.TARBALL = tmp / "lua-5.3.3.tar.gz"',
+    'sys.argv = ["lua_build.py"]',
+    'out = io.StringIO()',
+    'real, sys.stdout = sys.stdout, out',
+    'try:',
+    '    rc = lb.main()',
+    'finally:',
+    '    sys.stdout = real',
+    'print(json.dumps({"rc": rc, "header": (lb.SRC_DIR / "src" / "lua.h").is_file()}))',
+  ].join('\n');
+  const run = spawnSync(python, ['-c', code, src, tmp],
+    { cwd: root, encoding: 'utf8', timeout: 30000 });
+  assert.equal(run.status, 0, run.stderr || run.stdout);
+  const res = JSON.parse(run.stdout.trim().split('\n').pop());
+  assert.equal(res.rc, 0, 'dry run after extraction');
+  assert.equal(res.header, true, 'lua.h extracted to <input root>/lua-5.3.3/src');
+});
+
 test('client-array emulation documents what it cannot derive', () => {
   const c = readFileSync(join(src, 'src', 'host_gl_clientarrays.c'), 'utf8');
   // The max-index scan is the unavoidable cost; it must be present and named.
@@ -764,8 +805,10 @@ test('round 39: the client-array staging buffers are rings -- appends, orphan on
   assert.match(c, /static uint32_t ring_put\(GLenum target, gl_ring \*r, uint32_t initial,/, 'one append primitive for both rings');
   assert.ok(c.includes('} else if (r->head + need > r->cap) {      /* wrap: orphan, never overwrite */'), 'a wrap orphans the storage instead of overwriting bytes a queued draw reads');
   assert.ok(c.includes('if (src) glBufferSubData(target, (GLintptr)off, (GLsizeiptr)bytes, src);'), 'the upload lands at the ring head');
-  assert.ok(c.includes('(const void *)(uintptr_t)(at + (a->client_ptr - base)))'), 'interleaved attributes point at the ring offset');
-  assert.ok(c.includes('(const void *)(uintptr_t)(at + off))'), 'separate attributes point at the ring offset');
+  assert.ok(c.includes('point_attrib(i, a, at + (a->client_ptr - base));'), 'interleaved attributes point at the ring offset');
+  assert.ok(c.includes('point_attrib(i, a, at + off);'), 'separate attributes point at the ring offset');
+  assert.ok(c.includes('glVertexAttribPointer(i, a->size, a->type, a->normalized, a->stride, (const void *)(uintptr_t)off);'),
+    'round 107: point_attrib sends the pointer (unless the attribute already points there)');
   assert.ok(c.includes('glDrawElements(mode, count, type, (const void *)(uintptr_t)iat);'), 'the draw reads its indices at the ring offset');
   assert.ok(!c.includes('glBufferSubData(target, 0,'), 'nothing writes at offset 0 any more');
   assert.match(c, /rings orphaned %u \/ %u times/, 'the report counts the orphans');

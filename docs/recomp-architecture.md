@@ -9533,3 +9533,3021 @@ resident.
 
 **Not yet.** The headers' reads still fetch and decode the whole 1 MiB
 windows around them, so the boot still decodes the sound windows.
+
+### 21.130 Round 100: a guest C function that calls itself through Lua
+
+StageAPI, Encyclopedia and More Special Rooms in Greed hung the boot (21.121).
+The engine's log before the hang said `[heap] double free`, several times.
+
+Each Lua trampoline ran its guest function on a stack window fixed by its slot:
+`TOP - 0x8000 - slot * 0x400`, whatever the guest stack already held. A guest C
+function that re-enters itself through Lua therefore started on its own live
+frame. The game's `include` (0x00860000) runs a mod file, and a file that calls
+`include` again -- StageAPI's `library.lua`, `room.lua` and `reimpl.lua` do --
+overwrote the outer include's locals, return address and saved registers. Its
+`std::string`s were then freed twice, the guest heap was corrupt and the boot
+went round in it.
+
+Every other host-to-guest call goes just below the caller's live ESP, and this
+does now: each Lua shim records the guest ESP it was called with (`LUA_SHIM`
+wraps all 59), and a trampoline starts `LUA_GUEST_GAP` (0x400) below the
+innermost record. A Lua error longjmps past those records and past the
+epilogue of the trampoline's `isaac_guest_call`, which would have put
+`g_guest_call_esp` and the guest `jmp_buf` back; so a record is dropped once
+the host stack is back at or above it, and the oldest dropped trampoline's
+entry state is restored (`lua_nest_prune`). The selftest drives both through
+the real shims: a guest function that calls itself through `lua_getglobal` +
+`lua_callk` keeps its frame, and six errors raised through `luaL_error` out of
+a guest function, each caught in Lua, leave the next call's frame and the
+guest-call state where they were.
+
+The round was written on 2026-10-16 and never built into a release; it ships
+with round 101.
+
+### 21.131 Round 101: what stopped the game under a mod, found by using everything once
+
+Players reported `TRAP in main @ 0x00931050: Program terminated with exit(1)`
+right after `Action PillCard Triggered`, mods that stop the game, a stop when
+entering the alternate path's room, and one in the fight with Mother. Three of
+the reports carried the page's log, and none of them had the cause in it.
+
+**The cause was never in the log.** `isaac_log` prints through `console.warn`
+(so a line is not held back until a newline), and the page's log is what the
+module writes to stderr. So `[isaac][TRAP] ...`, `[isaac] reason: ...`, a
+throw nothing caught and a failed allocation went to the browser's console
+and nowhere else: the error panel and "Copy log" showed the game's last lines
+and the closing report. `boot_web.mjs` now takes the lines that name a stop
+(and only those: the routine ones would bury the game's log) into `isaacLog`,
+the out-of-memory line its first four times.
+
+**A walk that uses everything.** `drive_modpack.mjs` boots a mod and walks in
+the first room, which reaches none of the code behind a card, a pill, an item,
+an entity or a floor. `scripts/recomp/web/drive_stress.mjs` installs a mod of
+its own after the mods under test. It walks a list through the Lua API and
+through the game's own input actions (`MC_INPUT_ACTION` answers "the button is
+down", so the real use path runs and the engine logs `Action PillCard
+Triggered`), says what it is about to do (`STRESS OP <phase> <n>`), and the
+driver starts again past whatever stopped the module. The phases: every card
+and pill by the button and by `UseCard`/`UsePill`, every active item both
+ways, every passive, every trinket, every entity type, every floor that
+exists, every character, every special room, a list of odds and ends, a fight
+with every enemy (`fights`), a short run for one mod of a catalogue (`tour`),
+a Lua error raised in every callback (`luaerrs`) and a value of the wrong kind
+returned from every callback (`badrets`). The game's Lua has no `load`, so a
+one-off operation (`lua=<file>`) is pasted into the mod as a function body.
+
+With no mod installed, the cards, pills, actives, trinkets, rooms and the odds
+and ends all pass on the shipped engine. Three things did not.
+
+**1. A caught Lua error ran garbage (releases 14 to 18).** Round 95 carries
+out the C++ catch a mod's Lua error lands in, and resumes the guest through
+the longjmp replay in `isaac_guest_call_inner`: it dispatches `cpu->EIP`, and
+when that frame returns it dispatches `cpu->EIP` again, expecting the `ret` to
+have left the return address there. Round 96's call-slim (21.122) deleted
+every standalone `s->EIP = EIP;`, on the reasoning that the host reads
+`s->EIP` only after setting it itself. The replay is the exception, and the
+exit spill after a `ret` went with the call-site spills: 18,372 rets (the
+other 18,515 are the direct form `s->EIP = MEMR32(s->ESP);`, left alone). So
+the catch ran, the game logged `Error in "PostNPCUpdate" call: ...`, the
+continuation returned once, and the loop dispatched the same address again on
+a stack that had already been popped. `luaerrs` on the shipped engine: every
+callback that fired stopped the module, 39 of 39 in the 40 boots the driver
+allows itself, as "memory access out of bounds" (38) or as a quiet `exit(1)`
+(1) -- the reported message. The log of the
+alternate-path report shows the same thing from a player's side: the stack
+walk ends in 0x00872819 (the throw of `luabridge::LuaException`) under the
+`PreEntitySpawn` dispatcher, with External Item Descriptions and 16 other
+mods installed.
+
+`lift_patches.apply_ret_eip` puts the store back on the ret's own line
+(`EIP = MEMR32(ESP); s->EIP = EIP;`), where call-slim, which only takes
+standalone lines, leaves it. It runs after call-slim in `build_boot.py` and
+in `lift_patches.py`'s own `main`, and works on a fresh tree and on one
+already slimmed in place. `tests/recomp-call-slim.test.js` pins it (LF and
+CRLF, once, call-slim does not take it back, `--check` reports and leaves the
+tree alone).
+
+**2. The guest heap had 40 MiB left for a run.** The arena is 384 MiB (round
+69, against a measured peak of 350). `drive_stress.mjs phases=stages,rooms
+heap=20` prints the heap report as it walks the floors:
+
+| at | live |
+|---|---|
+| the first room | 359.2 MB |
+| floor 10 | 365.9 MB |
+| floor 19 | 377.6 MB |
+| floor 28 | 385.7 MB |
+| floor 37 | 393.1 MB |
+| the special rooms after | 395.4 - 396.7 MB, 6 MB free in 759 pieces |
+
+The boot takes about 343 MiB: the sound catalogue's 1,538 PCM buffers are
+allocated up front (262 MB; round 98 leaves most of them unwritten, which
+saves the RAM and not the address space), then the menus' textures and
+animations. What is left is 40 MiB, and a mod's Lua heap comes out of it too
+(`isaac_lua_alloc`): the alternate-path report had 12 MB of Lua. Past the end
+`malloc` answers NULL, and the game does not check. Holding every passive at
+once reached it in 250 items; a long run reaches it by loading.
+
+Making the arena larger moves the host base and the initial memory with it,
+which rounds 66, 69 and 97d took down on purpose. So the arena stays, and when
+it is full the allocator takes a 64 MiB segment from the host heap -- which
+grows the wasm memory only then, on the machines whose run needs it
+(`heap_grow`, `host_shims_heap.c`). A segment's blocks are on the same free
+lists as the arena's, a block never coalesces across the end of the region it
+lies in, and `isaac_is_guest_va` knows the segments (they are above the guard,
+which the address-space rule forbade; a pointer the host refuses would be a
+worse answer than the rule's exception). At most 16 segments;
+`ISAAC_HEAP_OVERFLOW=0` turns it off.
+
+The selftest fills the arena with five 96 MiB blocks (three fit, two come from
+segments), checks the bytes at both ends of each, the guards, and that a
+second fill reuses the segments. Writing it found a hole in the double-free
+guard that was there before: a block that merges backward keeps its old
+header inside the merged block, still saying "in use", so a second free of
+the same pointer passed the check and took the merged block apart. The header
+is cleared at the merge now.
+
+**3. No way back in.** A mod that stops the game on the way in left the
+player outside: the only switch for a mod was the game's own MODS screen,
+behind the boot (one report ends with a player clearing the site's data,
+saves included). The page now has three ways out, all the same move -- the
+mods are switched off in the store, where a mod that is off is simply not
+seeded, and nothing is deleted: `?mods=0`; a "Reload without mods" button on
+the error panel when a mod is on; and, because a hang shows no panel at all, a
+question before the boot when the last boot with mods on never reached the
+game (a mark in localStorage, set before the pipeline and cleared at
+readiness). `drive_nomods.mjs` checks all three against the engine's own log,
+13 checks.
+
+**`GetShaderParams`.** Round 95 left one of the 72 dispatchers' catches
+untranslated: its continuation (0x00865602) runs on into calls. The arm a
+thrown callback takes is short, though: the reference at `[ebp-0x20]` is only
+written after the callback's pcall has returned, so it is still -1, the result
+is `{L, LUA_NOREF}` and the `luaL_unref` of -1 is a no-op. `isaac_eh_tail`
+translates that arm (the eleventh tail) and leaves the other to stop as
+before. The walk's mod can carry a shader of its own (`shader=1`), which also
+shows a mod's GLSL compiling: an error raised in `MC_GET_SHADER_PARAMS` is
+caught and the game goes on.
+
+**Checked**, on the engine built from this tree (`boot.wasm` 91c56886...,
+54,568,440 bytes; the lift tree is release 18's with `apply_ret_eip`):
+
+- **Host selftest**: 752 checks, 0 failures (the nested guest call and the
+  six caught errors of round 100, the overflow segments, the cleared header,
+  the eleventh tail).
+- **A Lua error in every callback** (`luaerrs`): 0 stops. 64 of the 72
+  callbacks fired (`MC_GET_SHADER_PARAMS` in the run with a shader);
+  `MC_LEVEL_GENERATOR`, `MC_POST_GAME_END`, `MC_EXECUTE_CMD`, three projectile
+  callbacks, `MC_PRE_KNIFE_COLLISION` and `MC_PRE_MOD_UNLOAD` were not reached
+  by the walk. The shipped engine stopped on every one that fired.
+- **The alternate-path report, with its 17 mods** (`lua=` walking the secret
+  exit rooms and the Repentance floors): the shipped engine stops with
+  `Program terminated with exit(1)` -- there the throw found "no catch this
+  host can carry out", which is round 100's stack placement, not the replay.
+  The new one logs `Error in "PreEntitySpawn" call:
+  //mods/angels-drop-items/main.lua:325: attempt to compare number with nil`
+  222 times and plays on. The mod's `roomState` is nil in a room its table
+  does not know; the PC game logs the same line and carries on.
+- **A long run, compressed** (44 floors with a boss room each, then Mother in
+  both phases): the shipped engine fails `malloc(4194308)` with 395.5 MB live
+  as Mother spawns and stops in `UnhandledExceptionFilter`; the new one takes
+  one 64 MiB segment at the same moment (`the 384 MiB arena is full ...:
+  overflow segment 1`) and finishes the fight.
+- **Everything once, no mods**: every card and pill by the button and by the
+  API (273 operations), every active item both ways, every trinket, every
+  special room, every floor, the odds and ends: 0 stops. Every passive, one
+  at a time: 0 stops. Two things stop it that stop the PC game as well and
+  were left: `stage 7d` (Mortis is not in the game) and entities that are
+  parts of others spawned on their own (903.1, the Visage's).
+- **The catalogue**: all 203 mods through `tour` (a mod's own callbacks with a
+  bit of everything a player does in a few floors): 203 clean, 200 of them on
+  the build before the eleventh tail. Three were first reported by the driver
+  for reasons of its own (a 50 MB mod's boot is silent for longer than its
+  first limit, a menu that needed more Enters on a loaded machine, a socket
+  error) and passed on the final build when run again.
+- **StageAPI**, which hung the boot: loads, and the tour passes.
+- **The ways out of a mod**: `drive_nomods.mjs`, 13 of 13, on the dev page and
+  on a page packaged the way a release is (whose markup has no such button;
+  `play.mjs` makes it).
+- **The suites**: `tests/recomp-*.test.js`, 482 tests (five browser tests of
+  `recomp-portable` timed out while nine game instances were running beside
+  them, and pass alone, 65 of 65); `check-repo-safety`.
+
+**Not done.** Nothing is deployed: the live pages still run release 18's
+engine. The controller report from Android Chrome (a pad the page sees and the
+game ignores at SELECT A CONTROLLER) needs the device. The out-of-memory path
+is covered by overflow, not by a smaller boot: the sound catalogue's buffers
+still take 262 MB of the arena's address space.
+
+### 21.132 Round 102: a REPENTOGON-compatible layer, because REPENTOGON itself cannot run here
+
+The request was to recompile REPENTOGON so it works in the browser as a mod.
+It cannot be done as asked, and the reasons are measurable:
+
+- **It is for another game.** The port is v1.9.7.17 (J460). REPENTOGON, at
+  the submodule's commit and at upstream's head of 2026-11-09 alike, is for
+  v1.9.7.12 (J273); its installer downgrades the game.
+- **Its hooks do not land.** Of its 1,167 function signatures, 669 match this
+  executable exactly once, 74 more than once and 424 not at all
+  (`tools/zhl-resolve.mjs`). It also applies 286 patches in the middle of game
+  functions.
+- **It writes code while the game runs.** Its hooks and patches are assembled
+  at start-up into the process. A statically recompiled image does not execute
+  bytes written into `.text`.
+- **Its structures have moved.** `Game` is laid out as in .12 up to the item
+  overlay (0x1c034) and not after: the HUD is at 0x1da04 here and at 0x1d9ac
+  there, the frame counter at 0x264f8 against 0x25a70.
+
+What mods need of REPENTOGON is its Lua surface: 1,132 functions the game does
+not have, and 365 callbacks. Of the 210 mods in the workshop folder the
+catalogue was built from, 28 mention it; Fiend Folio needs it (357 functions,
+204 callbacks), and the rest read it as optional.
+
+So the surface is being rebuilt against this executable, as a layer of its own
+(`scripts/recomp/rgon/`, and its README). None of it is REPENTOGON's code.
+Its enum table, `enums_ex.lua`, is the one file used as it is: it is copied
+into the mod's archive at packaging time and ships under REPENTOGON's licence
+(GPL-2.0) beside the layer's own files.
+
+**The engine's part is small and general** (`host_rgon.c`): a bridge handed to
+one Lua file and to nothing else (guest memory both ways, a guest call with
+registers and stack words on a frame of its own, a luabridge userdata for a
+game object, a Lua function wrapped as a C one), hook slots, and a gate. The
+layer itself is Lua, `rgon.lua`, inside a mod named `repentogon`: the engine
+runs it once per Lua state before the first mod's own file, when that mod is
+installed and on. A function added to the layer is a new mod archive; only a
+new hook needs an engine build.
+
+Three things the work turned up:
+
+- **luabridge throws on a Lua method.** Its `__index` (0x0085cd40) returns
+  what it finds in a class table only when `lua_iscfunction` says so, and
+  throws `std::logic_error` otherwise, which stops the game here and on a PC.
+  So a method written in Lua goes in through `bridge.cfn`, a C closure around
+  it. (The game's own main.lua sidesteps the same thing by replacing
+  `__index`.)
+- **Mods are loaded with `luaL_loadfilex`**, three call sites; the buffer
+  loader has one, the console's. The layer boots before the first of either
+  that names a file under `mods/`.
+- **The game's own Lua registration gives this build's addresses.**
+  `addFunction("Name", &Class::Method)` compiles to `push <method>; push
+  <"Name">`, so 0x00866960 lists every exposed method with its address in
+  v1.9.7.17 and every data member with its offset: 62 classes, 923 functions,
+  149 properties, 284 data members (`tools/parse_register.py`). The hooks'
+  functions were found this way, not by signature: `AddCollectible`,
+  `HUD::Render`, `Entity_Pickup::Morph` and `MusicManager::Play` are among
+  the 424 that no longer match.
+
+**A callback is a hook.** `RGON_HOOKS` in `lift_patches.py` wraps 11 game
+functions the way the fast paths are wrapped; a wrapper tests one byte, runs a
+Lua handler before the function (which may rewrite its arguments on the stack,
+or answer for it with an EAX and a `ret n`), the lifted body, any parked tail
+jump, and a handler after. A hook is armed only while a mod listens on one of
+its callbacks. A hook enters Lua from inside lifted code without a Lua shim,
+so it records its own guest ESP for the duration (`isaac_lua_host_enter`): a
+trampoline placed from the shims' records alone would have landed on the live
+frames between the last shim and the hook.
+
+**The gate.** A mod that sees `REPENTOGON` takes its REPENTOGON-only paths and
+drops its fallback code, so a gap in the layer is a Lua error, or a feature
+that silently never runs. `REPENTOGON` is therefore not a global: the globals'
+`__index` answers it by the mod folder in the reading function's chunk name,
+for the mods the layer names, and nil for every other. Three checks go into
+naming a mod: `tools/coverage.mjs` (the REPENTOGON-only names its Lua uses
+against what the layer has), a run with `ISAAC_RGON_ALLOW=*` (its Lua errors,
+and the callbacks it listens on that the layer does not fire, which the layer
+writes to the game's log), and reading every use it makes of REPENTOGON. The
+third is not optional: two mods with no gap by the first two checks
+(mantle-rework, moderrorcontainer) switch themselves off under REPENTOGON
+because it does their job natively, and this layer does not.
+
+**What is in it now**: 58 names. Twelve callbacks over nine hooks
+(`MC_PRE/POST_ADD_COLLECTIBLE`, `MC_PRE_ADD_TRINKET`,
+`MC_PRE/POST_PICKUP_MORPH`, `MC_HUD_RENDER`, `MC_POST_HUD_RENDER`,
+`MC_HUD_UPDATE`, `MC_POST_HUD_UPDATE`, `MC_PRE/POST_SFX_PLAY`,
+`MC_PRE_MUSIC_PLAY`), `Level:GetDimension`, `EntityPlayer:GetHealthType`,
+`Isaac.CanStartTrueCoop`, `EntityPickup:IsBlind` and `:GetCollectibleCycle`,
+`Sprite:GetLayer` and `:GetAllLayers` with the 28 methods of a layer state,
+and `PlayerManager`. Four mods are let in: aarons-door-overhaul,
+enhanced-boss-bars, fireworks-for-good-items, reactionapi.
+
+**Checked.**
+
+- Host selftest: the bridge's primitives and its refusals, and the gate by
+  folder (760 checks in all).
+- `test_layer.lua`, inside a running game: 49 checks -- every function and
+  callback above, including a callback that rewrites the arguments, one that
+  cancels the call, floats read off the stack as floats, a pickup's item cycle
+  against a Glitched Crown pedestal, and a Lua error in a layer callback
+  logged and survived.
+- `test_gate.lua`: a mod the layer does not name reads nil by every route (7).
+- `tests/recomp-rgon.test.js`: the slots the layer names are the functions the
+  lift wraps, the wrapper's four steps in order, the archive's contents (6).
+- The wrapped functions with nobody listening: cards, pills, the odds and
+  ends, every trinket, every passive and every floor walked on the new engine,
+  0 stops; a Lua error in 30 of the game's own callbacks with the layer
+  installed, 0 stops.
+
+**Not yet.** Fiend Folio is 540 names away (`tools/coverage.mjs`), External
+Item Descriptions 28, StageAPI 48. The layer's mod is not in the published
+catalogue, and no engine with the bridge is deployed. ImGui has no equivalent
+planned: a menu drawn by REPENTOGON's ImGui will need the page's own.
+
+### 21.133 Round 103: Fiend Folio as the target, and three port bugs it walked into
+
+The layer of round 102 had 58 names. Fiend Folio, the mod it was started for,
+needs REPENTOGON outright (it shows a message and loads nothing without it),
+uses 357 of its functions and listens on 204 of its callbacks, and is 22,858
+files and 640 MB. This round is the work of getting it to load and into a
+run, and what turned up on the way. It is not finished: see "Where it stands".
+
+**Three bugs of the port itself**, none of them about REPENTOGON, each found
+because Fiend Folio would not load:
+
+- **Mods were loaded in folder order, not by name as on a PC.** The game sorts
+  its mod list by the `<name>` of each mod's metadata.xml (0x008f6190 is the
+  comparator, 0x008fcc90 the sort; a library names itself " Custom Stage API",
+  with the space, to be first). It builds each mod's paths on its current
+  directory, which is "/" here, so the metadata path came out as
+  "//mods/<dir>//metadata.xml". Its file layer (0x00a17180) takes a path as
+  absolute only if it starts with a drive ("X:/"), and its index of the mounted
+  tree holds "mods/<dir>/metadata.xml". So the open failed for every mod, every
+  name fell back to the folder, the sort became a sort by folder, and the game
+  then wrote a 139-byte stub metadata.xml over the mod's own. Fixed where the
+  path is resolved (`isaac_fs_plain_path_arg`, called from that function's
+  wrapper): a path that starts "//" is handed on relative, its doubled
+  separators folded. Three test mods whose folder, name and ASCII orders all
+  differ now load ` space`, `Zed`, `apple`; before, `d1`, `d2`, `d3`.
+- **A script asked for under another letter case was not found.** Fiend Folio
+  asks for `resources.luarooms.thelab`; the file is `TheLab.lua`. Windows does
+  not mind. The loader shim (`luaL_loadfilex`) now tries the name as given and
+  then each part of it without regard to case.
+- **There was no `os`.** The game opens seven of Lua's libraries and `os` is
+  not one; REPENTOGON gives mods `os.date`, `os.time`, `os.clock` and
+  `os.difftime`, and so does the layer now (the bridge hands it the library).
+
+**How addresses are found, widened.** Round 102 had the game's Lua
+registration and REPENTOGON's signatures. Added:
+
+- `tools/vtables.py`: a class's virtual table through its RTTI (the classes are
+  in the namespace `IsaacRepentancePlus`). The entity classes' slot order is
+  REPENTOGON's: Init 1, Update 3, Render 5, TakeDamage 8, HandleCollision 23.
+  It is checked against the game's own Lua thunks (`jmp [vtable+0xc]` is
+  Update, `+0x14` Render, `+0x20` TakeDamage) and against four Render
+  functions known by signature. That gave Update, Render, TakeDamage, Init
+  and HandleCollision for all twelve entity classes at once.
+- `tools/prop_offsets.py`: every plain property getter the game registers
+  (`mov eax, [ecx+disp]; ret`) is a measured field offset: 98 of them.
+- `tools/struct_deltas.py`: those offsets beside REPENTOGON's fields of the
+  same name. Entity, tears, lasers, familiars, NPCs, effects, pickups and
+  sprites agree everywhere they can be compared. The player does not.
+- `lab_player.lua`: for the player, a value is set through the game's own API
+  and then looked for in the object. The player's fields have moved by +0 (to
+  0x1368), +4 (0x145c..), +8 (0x14bc..), +12 (0x155c..), +16 (0x16b0..) and
+  +20 (0x1811..0x1dc0); `api_player.lua` offers a field only inside one of
+  those stretches.
+- A signature that matches once is still checked: its `ret` must pop what its
+  declaration says (43 of 45 functions called so far could be checked so, and
+  all did), and where the game's registration names the same function the two
+  agree (ten of ten). One unique match was wrong (a prologue with no
+  distinguishing byte); its callers showed it.
+- `tools/hook_table.py` holds the hook list and re-checks every entry against
+  the executable before it writes `RGON_HOOKS` and `hook_slots.lua`.
+
+**What "between two checked fields" is worth: nothing.** The first version of
+the entity fields took a REPENTOGON offset as good when the fields on both
+sides of it were confirmed. The in-game test then read a poison's damage and
+got 0: REPENTOGON's table has it at 0x278, and this build's `Entity::AddPoison`
+stores it at 0x320. A field is in the layer now because this build's code or a
+test says so, and for no other reason.
+
+**Hooks.** 132 game functions are wrapped (11 before). Two traps:
+
+- A function the lifter split into parts (the largest: the player's, tears',
+  familiars', effects' and projectiles' Update among them) has a comment on
+  its opening line, which the wrapper installer's pattern did not match. Seven
+  hooks were silently not installed; the in-game test for those callbacks is
+  what said so. The installer takes that line now and says when it cannot
+  place a wrapper.
+- The file layer's path function already had an observe-only wrapper, and a
+  second wrapper for the same address replaced it without a word, or was
+  replaced by it. Two wrappers on one function are a build error now.
+
+**The engine's callback runner.** `LuaEngine::Init` takes a registry reference
+to main.lua's `_RunCallback` and then clears the global, so nothing in Lua can
+stand between the engine and a callback list. The bridge can swap what a
+registry key holds (`registry`), and the layer reads the key out of the engine
+object. It is used so far for one thing: to know that one of the game's own
+PRE_x_COLLISION callbacks answered, in which case POST_x_COLLISION must not
+run.
+
+**An abort with no message.** A Lua error raised with no protected call
+around it ends in `abort()`, and the game sets no panic function, so nothing
+is printed. The layer's EntitySlot class (slot machines, which the game never
+gave to Lua) had borrowed Entity's finaliser, which raises an error on any
+object not exactly an Entity; the collector ran it inside a host API call. The
+class has no finaliser now, and the layer sets a panic function that logs the
+error first.
+
+**Accepted, not supported.** Some of what Fiend Folio calls while it loads is
+a change inside the game that the layer does not make: `Isaac.ReworkCollectible`
+(stop the game's own logic for an item), a backdrop or a boss colour a mod
+defines, REPENTOGON's renderer (a mod's own images and shaders), beams. Those
+names exist, do nothing, and say so once in the game's log (`[REPENTOGON]
+accepted, not supported in the browser: ...`); `REPENTOGON.Unsupported` lists
+them. They are gaps and are counted as gaps. Without them a mod of this size
+would stop at its first line that mentions one.
+
+**A signature that matched once and was wrong.** Hook slot 12 was put on
+0x00832850 as `Entity_Player::TriggerRoomExit` (for MC_PRE_ROOM_EXIT). The
+function pops nothing although the declaration takes a bool, it is outside the
+player's code, and its `this` begins with a state number (`mov eax, [ecx]; cmp
+eax, 2`), not a virtual table. With Fiend Folio listening, the handler wrapped
+ECX as a player and the module stopped ("memory access out of bounds", under
+`luaL_ref`). Found by arming the hooks a range of slots at a time
+(`?ISAAC_RGON_HOOKS=12-14`). The handler is gone and the callback is not
+fired; the wrapper stays in the engine with nothing listening on it. The
+`ret N` check that would have refused it reported "unknown" for this one and
+let it pass: unknown is now a reason to read the function before using it.
+
+**Where it stands.** In-game checks on the engine of this round: 49 + 95 + 7
+(`test_layer.lua`, `test_layer2.lua`, `test_gate.lua`), 0 stops. Fiend Folio's
+`main.lua` loads to its end with no callback error at the menu. In a run with
+the hooks off it plays (13 distinct Lua errors, each a name the layer does not
+have yet: `BlockCollectible`, `EntitySaveStateManager`, innate items,
+`GetEventCounter`, custom shaders); 134 of the callbacks it listens on are not
+fired. It is not in `ALLOW`, and the layer's mod is not in the catalogue.
+What a player without the layer gets from this round is the three port fixes
+above.
+
+### 21.134 Round 104: a pad plugged in after the boot, and a callback runner that survives an error
+
+Two separate pieces of work; the first changes the engine, the second only the
+layer's Lua.
+
+**A controller that appears after the game has started (issue 12).** On a phone
+a pad is seen by the browser only once a button is pressed, which is after the
+boot. The game's poller job (0x00a220c0, scan 0x00a6dab0) then saw it and
+logged "Gamepad Connected:", and nothing else happened: no Gamepad in the
+InputManager, no "SELECT A CONTROLLER!" answer, sticks dead. A pad that was
+there at boot worked, which is why desktop testing never saw it.
+
+The cause was in the host, not the game. A guest job runs in slices, and
+`isaac_threads_note_cs` treated a job that took the same lock again with no
+progress in between as an idle lap and yielded. The threshold was 2 repeats.
+The connect callback 0x00a21d40 takes the logger's lock (0x00a112c0) once per
+line it prints and the device-handle refcount lock (0x00d2228c) besides, so it
+was abandoned in the middle, after its second log line, every time. Two
+changes:
+
+- a log line is progress: `OutputDebugStringA` calls `isaac_threads_progress()`,
+  so a job that prints between two acquires is not idle;
+- the idle-lap threshold is 64 (`ISAAC_IDLE_LAPS` overrides it), and
+  `ISAAC_THR_TRACE` prints the job, the lock and the count when a job is
+  yielded for it.
+
+Checked by `scripts/recomp/web/drive_pad.mjs` (a virtual pad through the
+Gamepad API, appearing after the boot or present from the start): 8 of 8 on
+the new engine both ways; 2 of 8 on the engine before it, failing at exactly
+"the game takes the pad in". `tests/recomp-pad-hotplug.test.js` pins the host
+rule. Because the threshold applies to every background job, the whole
+catalogue was swept again on this engine: 203 mods, 203 clean, 0 stops.
+
+**The game's callback runner stops at the first error; REPENTOGON's does not.**
+With the hooks armed Fiend Folio played, and its log was a cascade: one of its
+functions on a callback raised (a name the layer lacks), the game's
+`_RunCallback` (resources/scripts/main.lua) left the whole list, and every
+function after it on that callback never ran, among them the one that builds
+`ffsavedata`. Everything that reads that table then failed too. Under
+REPENTOGON each function runs under its own `xpcall`, the error is logged, and
+the list goes on. The layer's runner now does the same for the game's own
+callbacks as well as for the ones it adds, with the per-callback rules
+REPENTOGON documents (MC_POST_ENTITY_REMOVE returns nothing,
+MC_POST_CURSE_EVAL folds its argument, MC_ENTITY_TAKE_DMG ends only on
+`false`, MC_POST_PICKUP_SELECTION carries a table on), and
+`Isaac.RunCallback` / `Isaac.RunCallbackWithParam` go through it. A mod's
+`__matchParams` on its callback list is honoured.
+
+**Names added** (`api_more.lua`, `api_data.lua`): `RNG:SetSeed(seed)` with the
+shift defaulting to 35; `RoomDescriptor:GetDimension` (put on a real
+descriptor's own tables at the first player init: the global `RoomDescriptor`
+is not where an object looks its methods up); `EntityPlayer:GetActiveItemSlot`,
+`GetMaxCoins` / `GetMaxKeys` / `GetMaxBombs` (the caps the game really
+enforces, 999 coins under Deep Pockets); `PersistentGameData:GetEventCounter`
+(the array at +0x2bc, from `mov edi, [esi+ebx*4+0x2bc]` at 0x00929b68 in
+IncreaseEventCounter); a mod's shader on a sprite is accepted and listed as
+unsupported.
+
+**A second pass over the addresses.** `scripts/recomp/rgon/tools/zhl_fuzzy.py`
+re-derives REPENTOGON's function list against this executable with wildcard
+distance and a `ret N` audit, and cross-checks every address the layer already
+uses. Two fail, both inert because nothing listens on them: slot 12
+(0x00832850, already known from round 103; it draws the room transition) and
+slot 21 (0x006bb790 as `Game::RestoreState`: it is an NPC virtual, slot 25,
+and pops 0 where the declaration says 8). The pass also gives candidates for
+the next engine round, each still to be confirmed by a probe before use:
+0x007a6680 for the real `TriggerRoomExit` (ret 4, called per player from
+Game::ChangeRoom), 0x0078ff90 `TriggerCollectibleRemoved`, and 31 of
+REPENTOGON's 46 mid-function patch sites.
+
+**Where it stands.** `test_layer3.lua` adds 17 in-game checks to the 49 + 95 +
+7. Fiend Folio with all hooks armed plays 45 s with no stop; it still raises
+about two dozen distinct errors for names the layer does not have
+(`EntitySaveStateManager`, `BlockCollectible`, innate items, chance revives,
+`CheckFamiliarEx`, two player fields) and about 120 of the callbacks it
+listens on are not fired. It is not in `ALLOW`, and the layer's mod is not in
+the catalogue.
+
+### 21.135 Round 105: the names Fiend Folio raised on in a run, and two measured layouts
+
+Layer only (Lua); no engine change in this part of the round.
+
+With round 104's runner a run with Fiend Folio went on, and its log listed
+what it still could not call: eleven distinct errors, about 11,000 lines a
+minute. Each is a name of REPENTOGON's; each was added with its own evidence.
+
+**Measured in a running game** (`lab_r105.lua`, `lab_hud.lua`):
+
+- `EntityPlayer:GetHallowedGroundCountdown` / `Set...`: 0x1d90. Of the 25
+  words from 0x1d60 it is the one that changes: 0 away from a holy poop, 3
+  beside one. REPENTOGON's 0x1d7c moved by 20, as the table in
+  `api_player.lua` predicts for that part of the object.
+- `EntityPlayer:GetFlippedForm`: 0x1e6c (REPENTOGON's 0x1e50 moved by 28).
+  After the player becomes Tainted Lazarus it is the one word of the object
+  that points at another player object; that object's type is 38 and its own
+  0x1e6c points back.
+- The HUD's eight player slots are 0x6dc bytes each here (0x6e0 in
+  REPENTOGON's version), from the HUD's start: each begins with its player,
+  the HUD and its own index, 0 to 7. The sprites that follow are each 0x20
+  lower than REPENTOGON has them, which is the same four bytes times eight,
+  and each was told by the file it has loaded (`ui_hearts.anm2` at 0x39a0,
+  `ui_chargebar.anm2` at 0x3778, and eight more). `HUD:GetPlayerHUD`,
+  `EntityPlayer:GetPlayerHUD`, a `PlayerHUD` object (GetPlayer, GetHUD,
+  GetIndex) and ten `HUD:Get...Sprite` come from this; a slot and a sprite
+  are checked each time they are handed out.
+
+**Read off the instructions:**
+
+- `EntityPlayer:IsCollectibleCostumeVisible`: 0x0075d9c0, the one match of
+  the signature, `ret 8`, and its body is the declaration (the layer argument
+  pushed, the collectible's entry fetched from the item config, the item form
+  0x0075d900 called).
+- `PlayerManager.GetEsauJrState`: four pointers at game+0x1bb28, 0x80 after
+  the player list as in REPENTOGON. The game's reset clears the four at once
+  (0x006f16ec), and 0x007ac7e0 allocates 0x2f00 bytes, constructs them and
+  stores the result at `[ecx+esi*4+0x1bb28]`. Using Esau Jr. from a script
+  did not take that path in the lab, so the non-empty case is checked where
+  it is read (what is there must be a player object) and is otherwise
+  untested.
+
+- `EntityPlayer:GetHistory` (the item tracker's list): 0x1dec.
+  Entity_Player::AddCollectible builds an item on its stack and calls
+  0x00721a70 with `lea ecx, [edi+0x1dec]`; 0x00721a70 is the one match of
+  History::AddHistoryItem, `ret 4`, and its body gives the layout (a vector
+  of 0x1c-byte items: time, trinket flag, id). `RemoveHistoryItemByIndex` is
+  the game's own (0x00721c00). An item handed to a mod is a copy.
+- `Game:GetDebugFlags`: 0x26544. The frame counter moved by 0xa88 between
+  the two versions (AddCollectible stamps the history item with
+  [game+0x264f8]); REPENTOGON's 0x25abc moved by the same is read or written
+  by 25 instructions, and in a run `debug 3` flips bit 2 of it and nothing
+  else.
+- `Level:GetGenerationRNG`: game+0x182d4, where REPENTOGON has it. The
+  game's reset stores the RNG default seed there (0xaa17414f, at 0x006f109f)
+  and the level code reads and writes it. The first check written for it
+  passed with the offset moved by 8: anything wrapped as an RNG behaves as
+  one. The check that replaced it regenerates the same floor twice and wants
+  the generator moved, and to the same state both times.
+
+**Over what the game offers:** `Entity:ToDelirium` (the NPC for Delirium,
+nil otherwise; Delirium's own functions are not there, and it is listed), `HasChanceRevive` (Guppy's Collar),
+`CheckFamiliarEx` (the familiars the game's CheckFamiliar spawned),
+`EntitySaveStateManager.GetEntityData` / `TryGetEntityData` (a table per mod
+and entity; a player by its object, anything else by type and InitSeed).
+
+**Two gaps, said in the log and listed in `REPENTOGON.Unsupported`:**
+
+- `EntitySaveStateManager`'s tables live for the run. REPENTOGON writes them
+  with the save and rewinds them with Glowing Hourglass.
+- `BlockCollectible` / `BlockTrinket` make scripts see the item as not held
+  (HasCollectible, GetCollectibleNum, HasTrinket, GetTrinketMultiplier); the
+  game's own code still sees it. Closing this needs the block inside the
+  game's four functions.
+
+**A mod that hooks the same function.** Fiend Folio's health library replaces
+`EntityPlayer.HasCollectible` with its own, which unblocks, asks the function
+it found, and blocks again. The first version of the block wrapped the game's
+functions when something was first blocked, and asked "does the player hold
+it" through the player's method: the mod's hook called Block, Block called the
+mod's hook, and the Lua stack overflowed 1,400 times a minute. Two rules came
+out of it: a wrapper over a game function is installed when the layer loads,
+before any mod can keep a reference to what it replaces; and the layer asks
+the game through the functions it captured then, never through a method a mod
+may have replaced.
+
+**Innate items** (`api_innate.lua`, `test_layer4.lua`): AddInnateCollectible
+and its family, the trinket forms, groups, durations, and the four
+MC_POST_ADD/REMOVE_INNATE_* callbacks. REPENTOGON does this inside the game's
+"does the player have it" functions. From Lua the game's own count of
+wisp-given items cannot be written: it is a map at player+0x1f80 that
+0x007d7740 rebuilds from the room's familiars and swaps in. So the layer uses
+what that function counts. An innate collectible is a real item wisp (familiar
+3.237 of the player), hidden: not visible (set again on every familiar update,
+the game shows it each frame), no collision, not targetable, out of orbit,
+unhurt. Removing one is `Remove()` and then the game's recount, called
+directly (0x007d7740: `ecx` the player, one stack word, `ret 4`, as its two
+callers use it). An innate trinket is a count on the smelted counters the
+layer already knew, with the game's trinket-added and trinket-removed
+functions and EvaluateItems. The books (groups, counts, what is left of a
+duration) are Lua's.
+
+Quit and continue was driven through the real pause menu. The game brings the
+wisps back without their flags and does not keep a count written on a smelted
+counter, so the layer writes its books to the save data of its own mod at
+exit, finds its wisps again on continue by a mark in their seed, hides them,
+puts the kept trinkets back and drops the unnamed group, as REPENTOGON does.
+Measured in the same page and after a reload. What differs and is listed:
+Glowing Hourglass does not rewind innate items; the wisps are real familiars
+to anything that walks the room's entities natively; a player's own item wisp
+has a 1 in 65536 chance of carrying the mark. Not tested: co-op, Tainted
+Lazarus, `AddCostume = false`. The same measurement says the layer's older
+`AddSmeltedTrinket` probably does not survive a continue either; open.
+
+**Where it stands.** `test_layer3.lua` is 53 checks (17 before) and
+`test_layer4.lua` 49; deliberate breaks of each new piece were caught by
+their own checks. In a full stress tour Fiend Folio does not stop the game;
+122 of the callbacks it listens on are still not fired.
+
+### 21.136 Round 106: fifteen engine hooks for the callbacks Fiend Folio listens on
+
+Engine (the `RGON_HOOKS` list in `lift_patches.py`, slots 80 to 94) and layer
+(`api_hooks.lua`, three rules in `api_callbacks.lua`, `test_hooks2.lua`).
+
+Round 105 ended with 122 callbacks Fiend Folio registers and the layer never
+fires. They were ranked by how many registrations each has, and the ones whose
+REPENTOGON hook is a whole function were taken: 31 of them fire now, 88 names
+are still reported as not implemented.
+
+**How a slot was probed.** `lab_h2.lua` puts a raw handler on every slot and a
+scripted run makes each event happen; the log says when the slot fired, what
+ECX held and whose virtual table that is, and the return address. A handler
+checks its object before it uses it (a player, pickup, tear, NPC or familiar by
+its class's virtual table; an item by looking it up again by id and wanting the
+same address; the room, the level and a HUD slot by a field that points back),
+logs a wrong one once and lets the call go on unwatched.
+
+**New slots.** Each address has its own evidence in the instructions, and every
+`ret` reached from the entry pops the count given.
+
+| Slot | Address, ret | What it is, and why | Callbacks |
+|---|---|---|---|
+| 80 | 0x0078ff90, 4 | TriggerCollectibleRemoved: called by RemoveCollectible and by the wisp recount; the argument is the item (0x2b6 leads to AddBrokenHearts(-3)) | MC_POST_TRIGGER_COLLECTIBLE_REMOVED |
+| 81 | 0x007a6680, 4 | TriggerRoomExit: Game::ChangeRoom calls it per player with 0, 0x009bd150 with 1; it tests the byte of its argument | MC_PRE_ROOM_EXIT |
+| 82 | 0x007bc740, 0 | InitPostLevelInitStats: called per player after Level::Init at run start; ends by setting player+0x1824 | MC_PLAYER_INIT_POST_LEVEL_INIT_STATS |
+| 83 | 0x008453c0, 0x18 | PlayerHUD::RenderActiveItem: ECX a 0x6dc HUD slot, six stack words | MC_PRE/POST_PLAYERHUD_RENDER_ACTIVE_ITEM |
+| 84 | 0x009555c0, 0 | Manager::Render: once a frame from the main loop | MC_PRE_RENDER |
+| 85 | 0x00930220, 0xc | TemporaryEffects::AddEffect | MC_POST_PLAYER_ADD_EFFECT, MC_POST_ROOM_ADD_EFFECT |
+| 86 | 0x00793970, 8 | TriggerEffectRemoved | MC_POST_PLAYER_TRIGGER_EFFECT_REMOVED |
+| 87 | 0x007911f0, 0xc | GetActiveMaxCharge(item, varData, unused) | MC_PLAYER_GET_ACTIVE_MAX_CHARGE |
+| 88 | 0x00791380, 4 | GetActiveMinUsableCharge(slot) | MC_PLAYER_GET_ACTIVE_MIN_USABLE_CHARGE |
+| 89 | 0x007f2800, 8 | Room::Init: ECX the game's room, first action ClearEffects | MC_PRE_NEW_ROOM |
+| 90 | 0x00744940, 4 | Level::Init | MC_PRE_LEVEL_INIT |
+| 91 | 0x0067af60, 0 | ApplyTearFlagEffects, static: ECX the entity, EDX the position, 0x18 bytes the caller removes (17 callers) | MC_PRE/POST_APPLY_TEARFLAG_EFFECTS |
+| 92 | 0x007a8fd0, 0 | TriggerRoomClear, per player from Room::TriggerClear's callee | MC_PRE/POST_PLAYER_TRIGGER_ROOM_CLEAR |
+| 93 | 0x007a8350, 0 | TriggerNewRoom_TemporaryEffects | MC_POST_PLAYER_NEW_ROOM_TEMP_EFFECTS |
+| 94 | 0x007a4ba0, 4 | TriggerNewStage(bool) | MC_POST_PLAYER_NEW_LEVEL |
+
+Handlers were also written for slots the engine already had: AddCostume and
+RemoveCostume (19, 20), DischargeActiveItem (53), DropTrinket (54),
+TryOpenChest (55), BombDamage (56, `ret 0x30`), BombTearflagEffects (57,
+`ret 0x20`), Level::SetStage (6, MC_PRE_LEVEL_SELECT), UsePill (33, `ret 0xc`,
+MC_PRE_USE_PILL) and Familiar::FireProjectile (77).
+
+**What the probe corrected.**
+
+- Slot 12's address for TriggerRoomExit was a signature match with no `ret`
+  evidence; it is retired and slot 81 is the function Game::ChangeRoom calls.
+- Slot 15 (0x0099b520, "InitPreLevelInitStats") has no callers and never
+  fires: MC_PLAYER_INIT_PRE_LEVEL_INIT_STATS is registered and silent.
+- Slot 21 fires with an NPC as `this` during an explosion; it is not
+  Game::RestoreState, and stays without a handler.
+- The fuzzy match for GetActiveMaxCharge (0x004cdd30) returns a bool. The real
+  one is 0x007911f0 and pops three words.
+- The console's `stage` does not call TriggerRoomExit, so MC_PRE_ROOM_EXIT
+  with newLevel was seen at run start and restart only.
+- MC_PRE_RENDER is not fired on a frame the render gate drops (round 93 skips
+  the Manager::Render call there).
+- BombDamage applies tear flags only when there are flags and a source, and an
+  enemy just hit or still appearing ignores the next explosion; the tests wait.
+
+**Tests.** `test_hooks2.lua`: 49 checks, at least one about behaviour per
+callback (a max charge answer of 2 makes FullCharge fill to 2; `true` or
+`false` from a PRE callback cancels the pill, the chest, the costume, the HUD
+draw, the bomb damage, the room clear; `{Damage = 0}` leaves the gaper's hit
+points as they were). 25 deliberately wrong handlers were each caught by their
+own check and nothing else. The tests found one bug of the round's own: two
+handler blocks shared the variables holding their callback ids, so the costume
+and bomb-damage handlers fired each other's.
+
+**Not done.** MC_POST_TEAR_DEATH and MC_POST_PROJECTILE_DEATH (REPENTOGON
+patches a virtual call inside Update; hooking Remove would also fire on room
+exit), MC_PRE/POST_PLAYER_USE_BOMB, MC_POST_ROOM_RENDER_ENTITIES and
+MC_EVALUATE_STAT (patches in the middle of a function), the weapon callbacks
+(no Weapon class in the layer), MC_POST_TRIGGER_COLLECTIBLE_ADDED, and a table
+answer to PRE_PLAYERHUD_RENDER_ACTIVE_ITEM (accepted, logged as unsupported).
+
+### 21.137 Round 107: waits that end on time, attribute state sent once, and a large mod read from packs
+
+Host (`host_shims_win.c`, `host_gl_clientarrays.c`, `host_gl_webgl.c`,
+`host_shims_fs.c`), page (`play.mjs`, `mods.mjs`, `boot_web.mjs`,
+`mod_browser.mjs`) and the packer (`assets/modpack.py`). No lifted code and no
+hook slot changed.
+
+#### Frame rate
+
+The profile of round 103's engine (a heavy room: 60 enemies, 160 to 180
+entities) said where a frame goes: 60% lifted game code, and nothing dropped at
+full speed on a desktop. With the main thread throttled four times the room ran
+at 29 fps, and two things in the host stood out.
+
+**The render gate's waits.** A skipped frame's wait and a drawn in-between
+frame's pace were plain timers, and a browser timer fires late: each wait asked
+for 5.4 ms and slept 10.9. They now go through `isaac_wait_js`: a timer set
+before the deadline, then MessageChannel hops (plain tasks, so input and
+fetches run between them) until the deadline has passed. A hidden page keeps
+the plain timer. `ISAAC_SKIPWAIT` picks the mode: 0 the old timer; 1 (default)
+the timer to 10 ms before the deadline; 2 the timer less the timers' running
+mean lateness; 3 as 2, less twice the mean deviation.
+
+Measured, heavy room at x4, four interleaved pairs against an engine built from
+the unchanged host with the same lifted objects:
+
+| | displayed/s | ticks/s | present p95 | slept / asked | busy share |
+|---|---|---|---|---|---|
+| before | 28.1 to 29.1 | 27.9 to 28.7 | | 1.98 to 2.08 | 0.88 to 0.92 |
+| mode 1 (shipped, with the GL change) | +1.92 (+0.98 to +2.37) | +1.30 (+1.05 to +1.88) | -3.4 ms | 0.98 to 1.00 | 0.98 to 0.99 |
+| mode 3 | +1.22 | +0.77 | | 1.07 to 1.12 | 0.94 to 0.97 |
+| mode 2 (round's first engine) | +0.67 | +0.93 | -1.45 ms | 1.27 to 1.31 | 0.92 to 0.94 |
+
+The price of mode 1 is the main thread: the hops fill time it would have sat
+idle (136 to 143 hops a wait). At full speed nothing is skipped, nothing hops
+and nothing changes (busy share 0.23 before and after, ticks +0.01/s). A
+throttled desktop is not a phone: timer lateness and the cost of the hops on a
+real device are not measured, and `ISAAC_SKIPWAIT=3` is the switch if heat
+matters more than frames.
+
+**Attribute state.** 61% of the WebGL calls of a frame were attribute churn:
+the engine enables its arrays before a draw and disables them after, the ring
+was bound before every upload, and every draw re-pointed its attributes.
+`ISAAC_GL_ATTR=1`: the ring's buffer is bound only when it is not the one
+bound; enables and disables are recorded and the draw sends the difference; a
+pointer WebGL already has is not sent again. `=2` (default) also keeps the
+pointers still: a draw with the layout the pointers describe is uploaded a
+whole number of 4-vertex groups past their base and drawn from that vertex
+(`glDrawArrays` first + v0, or the static quad index buffer from quad v0/4). A
+ring index block, another layout or a wrapped ring points the attributes at its
+own data, which is the new base.
+
+| calls per frame | total | enable + disable | pointer | bindBuffer |
+|---|---|---|---|---|
+| before | 1,548 | 626 | 313 | 106 |
+| mode 1 | 806 | 6 | 306 | 0.3 |
+| mode 2 | 536 | 6 | 15 | 0.3 |
+
+In the CPU profile the GL path (WebGL, the glue, the shims, the crossings) went
+from 495 to 415 microseconds a frame, 1.6% of the busy time; the estimate had
+been 4 to 6%. It does not show in the frame rate.
+
+The shift changes `gl_VertexID`. No shader can read it: the shim strips
+`#version`, so every shader is GLSL ES 1.00 (46 compiled in a run, none with a
+`#version`, none naming it). Nine screens (boot, title, menu, the first room,
+the heavy room three times, the pause menu twice) under a fake clock are
+byte-identical before and after, in both of the two timing families a boot
+falls into (an event before the first frame lands one pass early or late and
+changes the run's first seed; pairs are matched by the game log).
+
+**The game's WebGL context.** `play.mjs` asked `#canvas` for a context to read
+the renderer's name, before the engine created its own, so the game ran on the
+browser's defaults (antialias and alpha on, no stencil) and the engine's
+request was ignored. The name now comes from the start-up probe's context, and
+the game's context is what `host_shims_gl.c` asks for (no alpha, no antialias,
+stencil, preserved drawing buffer). The same nine screens are byte-identical;
+no speed change was measured at full speed.
+
+**The fifteen hooks of round 106 cost nothing measurable**: their wrappers took
+0 samples in four profiles, and the A/B against the engine without them is
+noise in both directions.
+
+Left for later, with the profile's estimates: music decode off the main thread
+(6 to 8% of the main thread at x4), the lifter's reloads of callee-saved
+registers after calls, a host fastpath for the item-ownership query.
+
+#### A large mod from packs
+
+Fiend Folio is 22,858 files and 670 MB; installed as every other mod (one
+archive, seeded whole into the heap) it needed 257 MB before the boot could
+finish and 1.39 GB of wasm memory, 297 MB of which was 1,519 WAV files the
+boot opens only to read their headers.
+
+**Ranged files.** A lazy file the page calls ranged
+(`Module.isaacLazyRanged(src)`, asked at its first open) is never loaded:
+`fread` and `fgetc` go to the positional reader that already serves the
+archives (a JSPI import) at the offset and length the guest asked for, into
+the guest's buffer. Opened to write it becomes an ordinary file (empty for
+"w", copied in for "a"); `isaac_fs_peek` has no bytes for it; with no
+positional reader it is loaded whole as before.
+
+**Packs.** `modpack.py --packed <folder>` cuts a mod into content-addressed
+packs (`pk/<hash>.bin`, each under 20,000,000 bytes, boundaries chosen by
+content so an update re-uploads only what changed) and an index
+(`pk/<hash>.idx`) with a blob of every WAV's header. Three lanes: what the
+boot reads (6 packs, 12.8 MB), sounds (71 packs, 243 MB), the rest (60 packs,
+173 MB): 137 packs, 428.7 MB stored. The output is deterministic and every
+file is read back and compared before the catalogue is written. The page
+(`mods.mjs`) installs a packed mod by fetching the index and the boot lane,
+keeps packs in the Cache API, checks each against the hash in its name, and
+answers a read from the header blob, a pack it holds, or by fetching the pack
+while the read is suspended; `play.mjs` says "Loading mod files..." when that
+takes more than 0.7 s. Packs are fetched whole, never by range. A catalogue
+entry without `packed` takes the old path unchanged.
+
+Measured on localhost (the page's own mod browser, a server refusing ranges):
+
+| | downloaded | wasm memory |
+|---|---|---|
+| after install (with StageAPI and the layer) | 18.7 MB | 640 MiB |
+| run start | 27.6 MB | 1,045 MiB |
+| after a tour | 43.0 MB | 1,179 MiB |
+
+17,282 header reads were answered from the blob, 395 reads waited for a pack,
+none failed.
+
+**A listing that stopped at 2,048.** `FS_FIND_MAX` was 2,048 and Fiend Folio's
+`resources/gfx/effects/dogs` holds 3,563 files; the engine's mount scan lost
+1,515 of them, and a sprite sheet among those was looked for in every mod
+folder and never opened, with `IsLoaded()` still true. The cap is 4,096 and a
+listing that meets it says so.
+
+**Tests.** The host selftest has 25 new checks (785, 0 failures) and
+`tests/recomp-modpacks.test.js` 7 tests; 11 and 12 deliberate breaks were each
+caught. `tests/recomp-gl-clientarrays.test.js` draws quad blocks from later
+quads of the static buffer with a ring block in between.
+
+**What a player will notice.** The first time a sound or a room's graphics of
+a packed mod is used its pack may have to be fetched (about 3.4 MB), so the
+sound can be late. Offline, what was never played is not on the device. The
+memory is still too much for most phones, so a touch-first device that does
+not report 8 GB is not offered a packed mod (`smallDevice` in `mods.mjs`): the
+list says NEEDS A COMPUTER and the install refuses. Not measured: phones, a real
+network, offline play in a browser.
+### 21.138 Round 109: what Fiend Folio still missed, from the top of the list
+
+Engine (the `RGON_HOOKS` list in `lift_patches.py`, slots 95 to 99) and layer
+(`api_extra.lua`, new; handlers in `api_hooks.lua`, the slot-0 handler in
+`rgon.lua`, one line in `api_innate.lua`, `test_hooks3.lua`, two checks of
+`test_hooks2.lua`).
+
+**Measured first.** A Fiend Folio tour (`drive_stress.mjs phases=tour` on a
+`dev_dist.py` dist with StageAPI and Fiend Folio in the instance tree, the
+layer beside them, `?ISAAC_RGON_ALLOW=fiendfolio-reloaded`) on the h2 engine
+with round 106's layer: 0 stops; 88 distinct callbacks reported as not
+implemented; two distinct Lua error lines from Fiend Folio:
+
+- `negative_charge.lua:28: attempt to call a nil value (method 'GetActiveMaxCharge')`,
+  150 lines, from MC_POST_PLAYERHUD_RENDER_ACTIVE_ITEM (the regression of round
+  106: the callback now fires, and the mod then calls a method the layer lacked);
+- `propaganda.lua:1347: attempt to index a nil value (global 'RoomTransition')`,
+  2,557 lines, from StageAPI's POST_HUD_RENDER: every frame.
+
+A second tour in probe mode (`?ISAAC_RGON_PROBE=1`) named the plain functions
+the tour reached and the layer lacked: `RoomTransition` (IsRenderingBossIntro),
+`EntityPlayer:GetActiveMaxCharge`, `EntityLaser:SetInitSound`,
+`Isaac.LoadModDataFromFolder` (`EntityTear.TearVariant` and `Color.Alpha` are
+Fiend Folio's own probes for fields, not REPENTOGON names).
+
+**Functions** (`api_extra.lua`):
+
+- `EntityPlayer:GetActiveMaxCharge(slot)` / `GetActiveMinUsableCharge(slot)`.
+  REPENTOGON's Lua takes a slot (0 to 3, default 0, anything else an error) and
+  calls the game's functions of a slot. Here those are 0x00791320 and 0x00791380
+  (slot 88), both `ret 4` on every path, both 0 for slot 3 and for slot 2 holding
+  item 0x244 while game+0x26584 is 0x2c; 0x00791320 then calls 0x007911f0 (slot
+  87) with the slot's item at player+0x1580+slot*0x20 and its varData at
+  +0x159c+slot*0x20, the ActiveItemDesc layout `api_player.lua` already uses
+  (REPENTOGON's signature for the slot form differs here by `mov eax, edx; shl
+  eax, 5` where it has `shl edx, 5`; the structure is the same). So
+  MC_PLAYER_GET_ACTIVE_MAX_CHARGE answers through these too.
+- `RoomTransition.GetTransitionMode`, `IsRenderingBossIntro`,
+  `GetVersusScreenSprite`. The game object is at [0x00c71678] and its room
+  transition at +0x1b83c: StartBossIntro's caller does `mov ecx, [0xc71678];
+  lea ecx, [ecx + 0x1b83c]` (0x004ac076), the game's render calls the
+  transition's render (0x00832850) with `lea ecx, [edi + 0x1b83c]`. The mode is
+  +0 (the render draws only for 2 and 3), the versus screen's sprite +0x38
+  (StartBossIntro replaces its spritesheets through `lea ecx, [edi + 0x38]`),
+  and StartBossIntro stores its first boss at +0x238 (0x0082f217), which with
+  mode 2 is when the render draws the versus screen (0x00832870..0x00832880):
+  that is IsRenderingBossIntro. The sprite is empty until the first boss intro
+  of the session loads `versusscreen.anm2` into it (measured). Not here:
+  StartBossIntro and GetPlayerExtraPortraitSprite.
+- `EntityLaser:SetInitSound(SOUND_NULL)`: the laser's start sound is played by
+  0x0096f880 (REPENTOGON's PlayInitSound signature matches it once), which
+  begins `cmp byte [esi + 0x518], 0; jne <end>`; the game sets that byte itself
+  in several places. Another sound needs the choice inside that function
+  replaced: accepted, said once, the laser keeps its sound.
+- `MultiShotParams` and `EntityPlayer:GetMultiShotParams(weaponType = 1)`. The
+  game's own Lua hands out a MultiShotParams userdata with no metatable at all
+  (measured: indexing it is an error), and REPENTOGON replaces the function.
+  The struct is read off Entity_Player::GetMultiShotParams 0x00781b90 (slot 71),
+  which fills the struct it is handed: the tear count is the word at +0 (it
+  writes the dword 1 there, then `add word ptr [ebx], ...`), lanes +2, the four
+  spread angles +4..+0x10 (90.0 into +0xc), eyes the dword at +0x14, the
+  multi-eye angle +0x18, three bytes at +0x1c..+0x1e, random tears the word at
+  +0x20: REPENTOGON's 0x24-byte layout. A MultiShotParams here is a Lua object
+  over 0x24 bytes of guest memory of its own, filled by calling that function,
+  with REPENTOGON's getters and setters (the bone's and the axe's spread is the
+  knife's times 3, as REPENTOGON has it).
+  Two things were measured on the way: the game's own `resources/scripts/main.lua`
+  puts a Lua `__index` in front of EntityPlayer's class ("Compatibility
+  wrappers") that answers from a table of its own first, and its
+  GetMultiShotParams (defaulting the weapon type) is in that table, so
+  replacing the class table's entry changes nothing; the layer puts one more
+  `__index` in front, for that one name. And `GetMultiShotPositionVelocity` is
+  registered by the game as a static function (its thunk 0x00882f90 binds
+  0x00782160, which pops nothing), so `player:GetMultiShotPositionVelocity` is
+  nil in this build; the layer adds it as a method that calls 0x00782160
+  (cdecl; PosVel through a hidden first argument, then loopIndex, weaponType,
+  the direction and speed, the params by value: its reads go up to
+  [ebp+0x3c]). Its answer is a table with Position and Velocity.
+
+**Callbacks on slots the engine already had:**
+
+| Callback | Slot, function | How |
+|---|---|---|
+| MC_POST_TRIGGER_COLLECTIBLE_ADDED | 0, AddCollectible | after it, before MC_POST_ADD_COLLECTIBLE, (player, item, firstTime, false), as REPENTOGON runs both from the end of its hook; `api_innate.lua` fires it with wispOrInnate true for an innate item |
+| MC_PRE/POST_ITEM_OVERLAY_SHOW | 28, ItemOverlay::Show 0x009ad210, `ret 0xc` on every path | `this` must be game+0x1c034 (Game::GetItemOverlay 0x00456860 is `lea eax, [ecx + 0x1c034]`); true cancels, an integer replaces the id (written to the stack word); POST is handed the id the game stored at +4 (0x009ad27a) |
+| MC_PRE_GRID_ENTITY_SPAWN | 22, Room::SpawnGridEntity | false answers false; a table replaces type, variant, varData, seed; a GridEntityDesc is accepted and not supported (said once) |
+| MC_EVALUATE_MULTI_SHOT_PARAMS, and the deprecated MC_POST_PLAYER_GET_MULTI_SHOT_PARAMS first | 71, GetMultiShotParams, `ret 8` | after it: a copy of what it produced is handed on, a MultiShotParams answered replaces it for the functions after and is copied over the struct; a callback calling GetMultiShotParams for the same player and weapon type gets the game's answer unwatched (REPENTOGON's recursion guard) |
+
+**New slots.** Every `ret` reached from the entry pops the count given
+(`.scratch/rgon/h2/rets.py`), `hook_table.py` 151 hooks, 0 failed.
+
+| Slot | Address, ret | What it is, and why | Callbacks |
+|---|---|---|---|
+| 95 | 0x006acb00, 0 | Entity::Remove: slot 10 (+0x28) of every entity class's vtable; REPENTOGON's `Remove()` signature matches it once | MC_POST_TEAR_DEATH, MC_POST_PROJECTILE_DEATH |
+| 96 | 0x00846ff0, 0x14 | PlayerHUD::RenderTrinket: called by the HUD's per-player render 0x009a6fe0 for slot 1 then 0 with (slot, &pos, 1.0, scale, 0); it draws nothing when the slot's trinket (+0x200+slot*0x18) or its image (+8) is 0 | MC_PRE_PLAYERHUD_TRINKET_RENDER |
+| 97 | 0x007ebd50, 8 | Room::SpawnGridEntityDesc (REPENTOGON's signature matches once); its callers are Room:TurnGold (0x00820ac0, the Lua registration's) and 0x004fdf80 | MC_PRE_GRID_ENTITY_SPAWN |
+| 98 | 0x004199d0, 8 | a render pass over the room's entity list: 13 callers, all in Room::Render (reg 0x0080f200) and 0x00820fd0 | MC_POST_ROOM_RENDER_ENTITIES |
+| 99 | 0x008151e0, 0x10 | Room::GetShopItemPrice: ecx the game's room, (variant, subtype, shopItemId, 0), one word more than REPENTOGON's declaration; its 7 callers store the answer as the pickup's Price (+0x534, the Lua property's offset) | MC_GET_SHOP_ITEM_PRICE |
+
+Three of REPENTOGON's mid-function patches turned out to sit right after or
+right at a call, so a hook on the callee with a return-address test is the same
+place:
+
+- **Tear and projectile death.** REPENTOGON replaces the call to Remove at one
+  place in each Update. Entity_Projectile::Update's `mov ecx, edi; call [eax +
+  0x28]` at 0x006580b3 is where its signature matches once (return address
+  0x006580b8). Its tear signature matches nothing here; Entity_Tear::Update
+  (0x006670f0, 0xeeb0 bytes) has two `mov eax, [eax + 0x28]; call eax; jmp
+  <the end>` and the one at 0x0066a366 is followed, as in REPENTOGON's
+  signature, by `push <imm>; mov edx, esi; lea ecx, [ebp - ..]`, with a `lea
+  esi, [edi + 0x428]` hoisted before the push (return address 0x0066a36b). A
+  tear removed by a script or on leaving the room returns elsewhere and does
+  not fire; a tear that falls and one that hits a wall do (measured, both).
+- **After the room's entities are drawn.** REPENTOGON's pattern (`33f68d87..
+  39b0..76..8bbd..6690`) is the code at 0x00810c97 in Room::Render, but for a
+  3-byte nop where it has `66 90`; the instruction before it is the last of
+  three calls of 0x004199d0, so MC_POST_ROOM_RENDER_ENTITIES runs after that
+  call when it returns to 0x00810c97.
+- **Shop price.** The callback answers for 0x008151e0; the callers then hand the
+  price to 0x00816250, which applies the player's discounts (Steam Sale's 0x40
+  and others), so the price follows the answer without being it.
+
+PRE_PLAYERHUD_TRINKET_RENDER's CropOffset changes the drawing inside the
+function in REPENTOGON: accepted, said once, and the cropOffset handed over is
+(0, 0) (REPENTOGON computes Monkey Paw's from a player field not measured
+here). Room::SpawnGridEntityDesc refuses an index whose grid path is above 900
+(0x007ebd90): a poop's is, so Room:TurnGold gilds nothing until the path is
+cleared (measured; the test clears it).
+
+**test_hooks2's two flaky checks** (PRE_APPLY_TEARFLAG_EFFECTS -> false, and
+-> {TearFlags = TEAR_SLOW}). They waited 20 frames and read the counters 2
+frames after one explosion. The failing runs had PRE not run at all
+("0 0 hp 995.0"): the explosion applied no flags to the gaper, as an enemy
+just hit or still appearing is skipped by the next explosion, and flags are
+applied (slot 91) only to an enemy the explosion takes. The gaper's hit points
+are no sign of a hit: a first rework waited for them to drop, and in its run
+PRE had run 8 times out of 12 explosions of 1 damage with the hit points at
+995.0 throughout. Now each check sets off one explosion at a time, 12 frames
+apart, until PRE has run (at most 12), and reads its counters then.
+
+**Tests.** `test_hooks3.lua`: 42 checks, at least one about behaviour per name
+(Larynx's minimum usable charge is 1 where its maximum is 12, and a
+MC_PLAYER_GET_ACTIVE_MAX_CHARGE answer of 2 is what GetActiveMaxCharge says;
+IsRenderingBossIntro is true while a boss's versus screen plays, sampled in a
+render callback because the game does not update during a transition; a
+brimstone laser made silent at MC_POST_LASER_INIT plays no sound where one
+without plays sounds 5 and 7; a falling tear, a tear hitting the wall and a
+falling projectile each fire their death callback once, a tear or projectile a
+script removes does not; MC_POST_ROOM_RENDER_ENTITIES fires once per frame
+after the player's render callback; the shop price follows the callback's
+answer; Room:TurnGold's poop stays plain when PRE_GRID_ENTITY_SPAWN answers
+false and turns golden without; a MultiShotParams answered from
+MC_EVALUATE_MULTI_SHOT_PARAMS is what the game's own function then answers).
+19 deliberately wrong handlers, in three groups, were each caught by their own
+check (23 failing lines: a wrong tear-death address fails both tear checks, a
+wrong overlay cancel also shifts the next overlay check's counts, a broken
+copy-back fails both multi-shot checks, a wrong room-render return address
+fails both room-render checks); nothing else failed with them.
+
+On the h3 engine with this layer: test_hooks3 42 0, test_hooks2 49 0 (three
+times in a row after the rework; once 49 2 with the first rework, which waited
+on hit points), test_layer 49 0, test_layer2 95 0, test_layer3 53 0,
+test_layer4 49 0, test_gate 7 0. The mutant pair for the two reworked
+test_hooks2 checks fails exactly those two with PRE seen (`tries 1`); that run
+also failed "PRE_NEW_ROOM: the descriptor is the start room's" once (96/97),
+which no mutant touches.
+
+**Fiend Folio, after.** The same tour on h3 with this layer: 0 stops, 0 Lua
+error lines from Fiend Folio (the two above are gone), 78 callbacks reported as
+not implemented (88 before: MC_EVALUATE_MULTI_SHOT_PARAMS,
+MC_GET_SHOP_ITEM_PRICE, MC_PRE/POST_ITEM_OVERLAY_SHOW, MC_POST_PROJECTILE_DEATH,
+MC_POST_ROOM_RENDER_ENTITIES, MC_POST_TEAR_DEATH,
+MC_POST_TRIGGER_COLLECTIBLE_ADDED, MC_PRE_GRID_ENTITY_SPAWN and
+MC_PRE_PLAYERHUD_TRINKET_RENDER are gone; nothing new). The probe tour now
+names one REPENTOGON function Fiend Folio reaches and the layer lacks:
+`Isaac.LoadModDataFromFolder`.
+
+**Not done, and why.**
+
+- MC_EVALUATE_STAT (18 registrations): five patches inside EvaluateItems, each
+  on a stat's running value in a register or a stack slot (REPENTOGON's
+  TearsUpHook, FlatTearsHook, DamageUpHook...), with no call at those points.
+  It needs what the lifter does not offer through RGON_HOOKS: a hook at an
+  instruction address inside a lifted function, handed the CpuState (so that a
+  handler can read and write a register or an [ebp-disp] slot) and resuming at
+  the next instruction. The BLOCK_PATCHES mechanism of `lift_patches.py` edits
+  lifted C in place and could carry such a call, but it is outside this round's
+  remit.
+- MC_POST_FIRE_SPLIT_TEAR (13): 18 patch sites (`ASMSplitTears.cpp`; Cricket's
+  Body, Parasite, Absorb, Spore, Ludovico and their laser and knife forms). Many
+  are a virtual call on the new tear right after it is spawned, so the
+  return-address technique of the death callbacks may serve site by site; each
+  site has to be found in this build first.
+- MC_PRE/POST_PLAYER_USE_BOMB (4/10): REPENTOGON patches control_bombs
+  (0x00780f40 here: its pre signature matches once, at 0x00781260) after the
+  bomb-count test and at the end of the placing loop. The pre point follows a
+  `jg` and precedes a HasCollectible(0x205) call; hooking HasCollectible for it
+  would put a Lua call on every HasCollectible. The post point is the loop's
+  end, after the bomb's own setup; the Spawn call inside the loop (0x0078157b)
+  is before that setup. Needs the instruction hook above.
+- MC_POST_PICKUP_SHOP_PURCHASE (9): REPENTOGON's signature for
+  TriggerShopPurchase matches 0x00918d00 once, but that function pops nothing
+  (the declaration has two arguments) and reads a "report player game state":
+  a false match. The real one was not found this round.
+- MC_POST_TRIGGER_COLLECTIBLE_ADDED for item wisps (REPENTOGON's
+  Entity_Familiar::WispInit hook): its signature is a generic prologue that
+  matches 13 functions here; not found. Normal adds and innate items fire it.
+- slot 15, MC_PLAYER_INIT_PRE_LEVEL_INIT_STATS: 0x0099b520 reads the room's grid
+  width and is no player function; REPENTOGON's signature (an SEH prologue with
+  `sub esp, 0x6c`) matches only it. The run start (0x006f5320) creates the
+  players through 0x009b8f40 before Level::Init and calls
+  InitPostLevelInitStats after it; the per-player function before the level was
+  not found.
+- MC_PRE_LEVEL_PLACE_ROOM, MC_PRE_FORTUNE_DISPLAY, MC_PRE_BACKDROP_CHANGE,
+  MC_IS_PERSISTENT_ROOM_ENTITY, the weapon callbacks: not reached this round.
+  Candidates read so far: HUD::ShowFortuneText 0x00912560 (signature, pops 0
+  where its declaration has one argument: unchecked), Backdrop::Init 0x0093d960
+  (signature, `ret 8`), Room::IsPersistentRoomEntity 0x007ed2a0 (signature, pops
+  0xc); RoomTransition::Update's signature match 0x00779b40 is called only by
+  Entity_Player::Update and is wrong.
+- MC_EVALUATE_CUSTOM_CACHE (7): REPENTOGON's custom caches are a system of
+  their own (`CustomCache.cpp`, 655 lines: items.xml `customcache`, the tears
+  cap, max coins, familiar multipliers); not started.
+- PRE_PLAYERHUD_TRINKET_RENDER's CropOffset, a GridEntityDesc answered for
+  Room:SpawnGridEntity, SetInitSound with a sound other than SOUND_NULL:
+  accepted, said once, not done.
+- Not seen going through Room::SpawnGridEntityDesc: a room's own grid entities
+  when it is entered again (measured: no call), so a PRE_GRID_ENTITY_SPAWN
+  that should keep a grid entity out of a revisited room (Fiend Folio's totems)
+  is not asked there. Where this build rebuilds them is not known yet.
+
+**Remaining, ranked** (callbacks Fiend Folio registers that no hook fires, by
+its number of registrations):
+
+78 in all: MC_EVALUATE_STAT (18), MC_POST_FIRE_SPLIT_TEAR (13), MC_POST_PLAYER_USE_BOMB (10), MC_POST_PICKUP_SHOP_PURCHASE (9), MC_EVALUATE_CUSTOM_CACHE (7), MC_PRE_LEVEL_PLACE_ROOM (6), MC_PRE_LASER_COLLISION (5), MC_POST_TRIGGER_WEAPON_FIRED (5), MC_POST_WEAPON_FIRE (5), MC_PLAYER_HEALTH_TYPE_CHANGE (5), MC_PRE_PLAYER_USE_BOMB (4), MC_POST_START_AMBUSH_WAVE (4), MC_POST_COMPLETION_EVENT (4), MC_POST_BRIMSTONE_SNEEZE (4), MC_PRE_PLAYER_GIVE_BIRTH_IMMACULATE (3), MC_PRE_PLANETARIUM_APPLY_ITEMS (3), MC_PRE_BACKDROP_CHANGE (3), MC_POST_GRID_ROCK_DESTROY (3), MC_POST_GRID_ENTITY_DOOR_UPDATE (3), MC_POST_DEVIL_CALCULATE (3), and 58 with one or two registrations each (`.scratch/rgon/r109/remaining.txt`).
+
+### 21.139 Round 110: instruction hooks, and the callbacks that needed them
+
+Engine (`RGON_INSN_HOOKS` and `apply_insn_hooks` in `lift_patches.py`;
+`isaac_rgon_insn_hook` and `reg()` in `host_rgon.c`), layer (`api_hooks.lua`,
+`hook_slots.lua`), tools (`tools/hook_table.py` `INSN_HOOKS`), tests
+(`test_hooks4.lua`, `tests/recomp-insn-hooks.test.js`). Engine `h4`.
+
+**The mechanism.** Most of what Fiend Folio still listened on fires in the
+middle of a game function, on a value in a register or a stack slot, where
+there is no call to wrap. An instruction hook is a block of C the lift-patch
+phase puts into the lifted body right after one instruction's
+`RECOMP_VA(0x<va>u);` marker, or after the instruction's own `L_<va>: ;` label
+when that follows the marker (the lifter's order; a jump to the instruction
+then runs the hook too). The block tests the slot's byte in `g_rgon_hook_on`
+first, and only when a handler is installed spills the function's register
+locals (the eight general registers the body declares as `X = s->X`; never EIP,
+FS_OFFSET, the flags or the x87 locals), calls
+`isaac_rgon_insn_hook(slot, s, va, targets)`, reloads them, and takes one
+`goto L_<t>` per allowed target. The SSE registers are always in the CpuState in
+lifted code, so a handler reads and writes xmm with `B.xmm(n [, v])`, the
+general registers with the new `B.reg(name [, v])` (ESP read-only), and
+`[ebp-disp]` as memory; the flags stay in their locals, untouched. A handler is
+called as `handler(va, esp, ebp)` and answers nil (the instruction runs on what
+it left) or one of the hook's own targets. **Redirects** are explicit: each
+target is listed in the table entry, must already be a label (`L_<t>: ;`) of the
+same function -- a place the game itself jumps to -- or the build stops, and is
+written into the C both as the goto and in a 0-terminated `rgon_to[]` the host
+checks the answer against; any other answer is logged ("not one of its jump
+targets") and ignored. A function nobody hooked costs nothing; a hooked one
+costs the one-byte test on that instruction's path. The engine says it has all
+this with `B.INSN`; on an older engine the layer leaves these callbacks
+unimplemented.
+
+Rules the pass enforces, each a build error (`SystemExit`), never a skip: the
+function in exactly one TU; the marker exactly once among its bodies (the
+`__lifted` body of a wrapped function, the parts of a split one); the label at
+most once; a target without a label; a slot outside 0..191, used by
+`RGON_HOOKS`, or listed twice; an address listed twice; the function's own
+entry (that is a function hook). Each block sits between `/* LIFT-PATCH insn
+0x<va> slot N begin ... */` and `/* LIFT-PATCH insn 0x<va> end */`: a second run
+leaves it alone, a changed entry replaces it, a removed entry takes it out and
+leaves the function byte for byte as it was, CRLF stays CRLF.
+`apply_lift_patches` runs the pass (so do `build_boot.py` and `--check`, which
+reports a block to install, replace or retire). It runs before the wrappers and
+the split of the giants, which carry the block along; on a tree already wrapped
+or split it finds the body under its new name. Two things the split taught: it
+can cut between an instruction's marker and its label (the marker ends one
+part, the label heads the next), so the block follows the label whenever the
+label comes after the marker; and a target in another part is written in
+split_giants.py's own cross-part form (spill, `__next`, `__pend`, return),
+which its unsplit turns back into a goto, so the pass reads its own output as
+current.
+
+Slots go on from 160 (the entity virtuals end at 159). `tools/hook_table.py`
+checks each row against the executable (the instruction and every target are
+instructions of the function the row names, `pequery.py func`/`disasm`) and
+`--write` prints the list for `lift_patches.py` and the hook_slots.lua rows
+(`["Class::Function@Point"] = { slot, false, address }`).
+
+**The hooks** (the evidence of each is also in `tools/hook_table.py`):
+
+| Slot | Function, instruction | Evidence | Callback |
+|---|---|---|---|
+| 160 | EvaluateItems 0x00763570, 0x00764864 | REPENTOGON's EvaluateItems_TearsUp signature matches once, at 0x0076485c (`movss [ebp-0x474], xmm1; mulss xmm1, [0xbaa4cc]`, 1.3f); its patch point is +8, the mulss. 0x00764864 is also the target of the `jle` at 0x00764856, with xmm1 = [ebp-0x474] on both ways in. The player is EvaluateItems' `this`, kept at [ebp-0x458] (one store, 0x0076359f) | MC_EVALUATE_STAT TEARS_UP: [ebp-0x474] and xmm1 |
+| 161 | EvaluateItems, 0x00764f2e | REPENTOGON's FlatTears signature matches nothing; the same code with the player in a stack slot instead of esi is 0x00764f26 `movss [ebp-0x460], xmm2`, 0x00764f2e `mov ecx, [ebp-0x458]; push 0; push 0xf5; call 0x7706e0; test al, al; jne`. [ebp-0x460] is what 0x00765603..0x0076561f turns into MaxFireDelay (30 / (it * [player+0x1948]) - 1); also the target of `je` at 0x00764f08 | FLAT_TEARS: [ebp-0x460]; an answer of 0 or less is ignored |
+| 162 | EvaluateItems, 0x007662a9 | the DamageUp signature matches once, here. The sum is [esi]: esi = [ebp-0x460] (0x00766188) = player+0x1470 (`lea esi, [eax+0x1470]` 0x00765740, zeroed and stored at 0x00765748/0x00765750), the Lua data member Damage's offset | DAMAGE_UP: [esi], checked to be player+0x1470 |
+| 163 | EvaluateItems, 0x00766ad0 | the FlatDamage signature matches once, here; esi = the player on all three ways in | FLAT_DAMAGE: [player+0x1470], esi checked to be the player |
+| 164 | control_bombs 0x00780f40, 0x00781266, target 0x00781b84 | the pre signature matches once, at the `jg 0x781b84` (0x00781260) after `cmp [edi+0x1610], 0`; the hook is the instruction after it and a cancel goes where the jg goes (`pop edi; pop esi; mov esp, ebp; pop ebp; ret`). edi = the player; 0x00780f40's only caller is Entity_Player::Update (0x00785bc9) | MC_PRE_PLAYER_USE_BOMB: false cancels |
+| 165 | control_bombs, 0x00781b6b | the post signature matches nothing; the placing loop's end here is `mov eax, [esp+0x30]; lea esi, [edi+0x33c]; inc eax; mov [esp+0x30], eax; cmp eax, [esp+0x48]; jl`, right after the bomb's Update (`mov ecx, [esp+0x20]; mov eax, [ecx]; call [eax+0xc]`); [esp+0x20] is Game::Spawn's answer (0x0078157b, stored at 0x00781587) | MC_POST_PLAYER_USE_BOMB (player, bomb) |
+| 166 | Entity_Tear::Update 0x006670f0, 0x006697ba | the SplitTears_CricketsBody signature matches twice (0x006697b1, 0x0066a317); 0x006697b1 is the loop that runs 4 times behind the tear-flag test on the BitSet128 at 0x00c34880; the hook is the instruction after the new tear's Update call; esi = the new tear, edi = the tear (`mov edi, ecx`, 0x00667135). The second match (its loop count comes from 0x0067f010(5)) is not identified and not hooked | MC_POST_FIRE_SPLIT_TEAR, QUAD |
+| 167 | 0x00676be0 (a thiscall on the tear, called 5 times by Entity_Tear::Update; REPENTOGON's "trigger_collision"), 0x006770c2 | the Parasite signature matches once, at 0x006770bb, behind the flag test on 0x00c34850 (bit 6, TEAR_SPLIT); a loop of 2; esi = the new tear ([ebp-0x5c]), edi = the tear ([ebp-0x98] = this) | PARASITE |
+| 168 | 0x00676be0, 0x00677498 | the Bone signature matches once, at 0x00677491, behind the flag test on 0x00c348f0 (bit 51, TEAR_BONE) and a height test; esi = the new tear ([ebp-0x64]), edi = the tear | BONE |
+
+The split-tear callback is fired after the new tear's first Update, as
+REPENTOGON's trampoline does, with (tear, source, splitType) and the split type
+as the parameter. A bone that hits a wall does not go through 0x00676be0 (a
+measurement: only a bone hitting an enemy split there). REPENTOGON also adds the
+stat changes of its items.xml attributes at the stat points
+(`CalculateStatChange`); the layer reads no such attributes, so MC_EVALUATE_STAT
+hands over the game's own values.
+
+**Hot paths.** Every hook sits on a path that is not taken per frame per
+entity: EvaluateItems runs when a cache is evaluated; control_bombs reaches
+0x00781266 only when a bomb is about to be placed and 0x00781b6b once per placed
+bomb; the three split hooks only on their split branches. So the one-byte test
+is in no per-frame loop. No frame-rate effect was measured either way.
+
+**Tests.** `tests/recomp-insn-hooks.test.js` (node --test, 9 tests) drives the
+pass over small synthetic TUs: the block's place and shape (after the marker
+and label, only the register locals spilled, never EIP or the flags, one goto
+per target), idempotence, replacement, byte-for-byte retirement, CRLF, a wrapped
+function, a split function hooked before and after the split (including the cut
+between marker and label), the label-first order, ten build errors, that
+`apply_lift_patches` carries the table, and host_rgon.c's refusal of an
+unlisted answer. 9 mutants through `scripts/decomp/mutate.mjs`, each killed by
+that suite: the label rule (2), the register filter, "exactly once", the
+retirement, the idempotence test, the cross-part form, the
+`apply_lift_patches` wiring, and the host's target check (a text check; the
+behavioural one is the layer mutant below).
+
+`test_hooks4.lua`, 23 checks: the four stat points fire once each, in order;
+FLAT_DAMAGE is the damage the player ends with and an answer of 7.25 is the
+damage; one more DAMAGE_UP gives 3.5 * sqrt(2.2) = 5.1913 at FLAT_DAMAGE and in
+Damage; FLAT_TEARS 3.0 gives MaxFireDelay 9.0; 0 and -2.5 are ignored;
+TEARS_UP + 0.5 gives FLAT_TEARS 30 / (16 - 6 * sqrt(1.65) + 1) = 3.2283; with
+Sad Onion and Pentagram TEARS_UP is handed 0.7 and DAMAGE_UP 1.0; the
+parameter selects the stat; the chain is additive; a PRE_PLAYER_USE_BOMB
+answering false leaves no bomb placed, none spent and no POST; true places one
+and spends one; POST runs once, after PRE, with the bomb in the room (its
+SpawnerEntity the player); a PRE for another variant is not asked; Cricket's
+Body's landing tear fires 4 times, Parasite's hit twice, a Compound Fracture
+bone's hit once per bone, each with a new tear, the source and the type, and a
+QUAD-only function runs only for the quad split.
+
+Layer mutants (`.scratch/rgon/mutzip.py`, test_hooks4 on h4), every one caught
+by its own check: a cancel answering 0x00781b85 (refused by the engine, the
+bomb is placed: the cancel check), the bomb read at [esp+0x24] (both POST
+checks), the TEARS_UP slot [ebp-0x478] (the Sad Onion check: it read 0.0; the
+check was added because the first run of this mutant survived, plain Isaac's
+sum being 0 too), xmm1 not written (both TEARS_UP checks), the DAMAGE_UP
+register test +0x146c and the FLAT_DAMAGE address +0x1474 (their checks), the
+FLAT_TEARS slot [ebp-0x474] (the FLAT_TEARS 3.0 and TEARS_UP checks), the
+positive-only guard dropped (the ignore check), the player slot [ebp-0x45c] (9
+EVALUATE_STAT checks), the split's new tear read from edi (all three split
+checks), Parasite's type given as BONE (the Parasite check). A first try with
+the FLAT_TEARS slot at [ebp-0x464] trapped the game (that slot holds a
+pointer), so it was replaced by the harmless [ebp-0x474].
+
+On h4 with this layer: test_hooks4 23 0, test_hooks3 42 0, test_hooks2 49 0,
+test_layer 49 0, test_layer2 95 0, test_layer3 53 0, test_layer4 49 0,
+test_gate 7 0 (drive_stress.mjs through `.scratch/rgon/r110/suites.sh`; the
+other seven ran with the same layer archive while test_hooks4 still had 22
+checks). `node --test tests/recomp-rgon.test.js tests/recomp-host.test.js
+tests/recomp-web.test.js tests/recomp-insn-hooks.test.js`: 84 pass, 0 fail, 5
+skipped (audit outputs not present, as before). `lift_patches.py --check` on the
+tree: 0 TUs to change. `check-repo-safety.mjs` passed.
+
+**Fiend Folio, after.** The tour on h4 (`.scratch/rgon/r110/mk_ffh4.sh`, port
+8346, `?ISAAC_RGON_ALLOW=fiendfolio-reloaded`): 0 stops, 0 Lua error lines, no
+hook errors in the log, 74 callbacks reported as not implemented (78 before:
+MC_EVALUATE_STAT, MC_POST_FIRE_SPLIT_TEAR, MC_PRE_PLAYER_USE_BOMB and
+MC_POST_PLAYER_USE_BOMB are gone; nothing new).
+
+**Not done, and why.**
+
+- MC_POST_FIRE_SPLIT_TEAR at REPENTOGON's other places. Matched once and not yet
+  hooked or tested: the knife's five in 0x0096ae70 (Cricket's Body 0x0096b607,
+  Parasite 0x0096c345, Haemolacria 0x0096b8cb, Compound Fracture 0x0096c64f,
+  sticky 0x0096cb1e), the sword beam (two matches, 0x00630b6c and 0x0096237e;
+  the second is in Entity_Knife::Update), Lachryphagy (0x0066ef3e), Ludovico's
+  sticky (0x006743f4, in Entity_Tear::HandleCollision), the laser's sticky
+  (0x009726af) and Pop! (0x0097739b, which also needs REPENTOGON's flat patch of
+  a jump that matches nothing here). Haemolacria's tear site (0x00678b68) is
+  lifted into five overlapping functions, so there is no one function to hook.
+  No match: the laser's Cricket's Body, Mucormycosis (perhaps 0x0066a317),
+  Angelic Prism. MakeMultidimensionalCopy (a function hook) is not done either.
+- REPENTOGON's items.xml stat attributes (the XML half of its stat hooks, and
+  its RangeUp/SpeedUp/ShotSpeedUp patches, which only apply those): not read.
+- A handler cannot see the flags or x87 state a function keeps in locals (only
+  `FPUInstructionPointer` was seen as one); no hook here needs them.
+
+**Remaining, ranked** (callbacks Fiend Folio registers that no hook fires, by
+its number of registrations):
+
+74 in all: MC_POST_PICKUP_SHOP_PURCHASE (9), MC_EVALUATE_CUSTOM_CACHE (7), MC_PRE_LEVEL_PLACE_ROOM (6), MC_PRE_LASER_COLLISION (5), MC_POST_TRIGGER_WEAPON_FIRED (5), MC_POST_WEAPON_FIRE (5), MC_PLAYER_HEALTH_TYPE_CHANGE (5), MC_POST_START_AMBUSH_WAVE (4), MC_POST_COMPLETION_EVENT (4), MC_POST_BRIMSTONE_SNEEZE (4), MC_PRE_PLAYER_GIVE_BIRTH_IMMACULATE (3), MC_PRE_PLANETARIUM_APPLY_ITEMS (3), MC_PRE_BACKDROP_CHANGE (3), MC_POST_GRID_ROCK_DESTROY (3), MC_POST_GRID_ENTITY_DOOR_UPDATE (3), MC_POST_DEVIL_CALCULATE (3), MC_NPC_GRID_COLLISION (3), MC_POST_GLOWING_HOURGLASS_SAVE (3), MC_CONSOLE_AUTOCOMPLETE (3), MC_PRE_TRIGGER_BED_SLEEP_EFFECT (3), and 54 with one to three registrations each (`.scratch/rgon/r110/remaining.txt`). Several of these are REPENTOGON patches in the middle of a function (MC_PRE_LASER_COLLISION, MC_POST_WEAPON_FIRE, MC_POST_TRIGGER_WEAPON_FIRED, MC_PRE_LEVEL_PLACE_ROOM), now a matter of finding each place here.
+
+### 21.140 Round 111: a press in a frame the render gate skips, and luabridge's lookup in native code
+
+Engine (`isaac_input_edge_now` and `isaac_render_gate_decide_input` in
+`host_shims_win.c`; `lb_index_native` and `call_guest_fn` in `host_lua.c`),
+tests (`selftest.c`: `test_input_edges` and the native `__index` block), lab
+scripts (`lab_pause.lua`, `lab_trigpad.lua`, `lab_index.lua`, beside the
+round's earlier `lab_trig.lua`, `lab_trig2.lua`, `lab_dss.lua`). Engine `k2`
+(`k1` is the same but for the verify mode's userdata comparison, below). No
+lift patch changed: both parts are host code.
+
+Players said Fiend Folio was "super laggy and scuffed". Two causes were
+measured and both are engine-side.
+
+#### A press the render gate's skipped frame took from the mods
+
+**The problem, measured.** With Fiend Folio loaded, a mod counting
+`Input.IsButtonTriggered(key, 0)` in MC_POST_RENDER saw 6 of 24 key presses
+with the render gate on (round 93, the default) and 24 of 24 with
+`?ISAAC_RENDER_GATE=0`. Fiend Folio opens a Dead Sea Scrolls changelog at the
+start of a run that is closed with C or F1; with presses lost it stayed open,
+and its text drawing halved the frame rate.
+
+**The mechanism** (instruction stream, `pequery.py body`):
+
+- Manager::Update (0x00954cd0) returns at once on an odd frame count only
+  when [Manager+0x2a3c0] is clear (0x00954d0f `cmp byte [edi+0x2a3c0], 0`);
+  with it set, the body runs on the in-between pass too and runs the game
+  logic only on even counts (0x009551cf `test byte [edi+0x4abbc], 1`). The
+  body polls the pads (0x00a6de60 at 0x00954f73) and updates every input
+  device (0x00a1fc00 at 0x00954f7d, ECX = the input manager 0x00c57b18),
+  both behind `cmp byte [ebp+8], 0` (main's 0x009ab6d0 passes 1, 0x009ab6f0).
+  The flag's value was not read at run time; that the devices advance on the
+  in-between pass is what the measurements below show (in-between frames
+  drawn because a press was in them). So
+  the devices advance on every pass of main's loop, the in-between one
+  included, which is what the recorded callback order (`lab_trig2.lua`)
+  showed.
+- The keyboard device (vtable 0x00ba1678): IsButtonTriggered (slot 10,
+  0x00a6c540) is `[ecx+8] & 2`, key < 0x15d, current [0x00c78c10+key] != 0
+  and previous [0x00c78950+key] == 0; its update (slot 30, 0x00a6c650) copies
+  current to previous (`rep movsd` 0x57 dwords + one byte from 0x00c78c10 to
+  0x00c78950) and pending (0x00c78ab0) to current.
+- So a press is "triggered" in exactly one pass. When that pass is an
+  in-between pass whose render the gate skips (main's render call 0x009312f1),
+  MC_POST_RENDER never runs in it, and the next pass's update has already made
+  previous := current.
+
+**The design.** The gate draws an in-between pass that holds a newly
+triggered key or button, exactly as with the gate off, instead of latching
+triggers for Lua. Nothing is rolled back, delayed or answered differently:
+the device state, every device update and every query are the game's own.
+So no consumer -- an engine one (the pause menu, the player's controls) or a
+mod's -- can see a trigger twice, and every consumer sees each trigger in the
+same pass it sees it in with the gate off, which is the game's own behaviour.
+A latch would have needed to tell a Lua query from an engine one inside the
+game's own input functions, cover IsActionTriggered's action mapping and the
+pads' button numbering, and would still hand a mod a trigger one pass late
+and, in an update callback, in a pass where the game without the gate shows
+none. The price of drawing is one render per press, and only on a device
+that is behind (one that keeps up draws every in-between pass anyway).
+
+"Holds a new trigger" is read off the devices after the pass's update: the
+gate is asked at 0x009312f1, after Manager::Update and before the render, and
+nothing between the two updates a device. The devices are the input
+manager's vector at [0x00c57b18+8, +0xc) of 8-byte entries, object first
+(its slot +0x74, 0x00a20fb0: `sar eax, 3`, `mov ecx, [ecx+edx*8]`). RTTI
+names three device classes: InputDeviceKeyboard, InputDeviceGamepad and
+NetInputDevice (whose slots 9 and 10 are both 0x0042cb80). For each entry:
+
+- keyboard (vtable 0x00ba1678): any key with current != 0 and previous == 0
+  (the flag test left out: a superset);
+- gamepad (vtable 0x00b82c80): IsButtonTriggered (slot 10, 0x00a1e640)
+  answers true for a button only when, after IsButtonPressed (slot 9), its
+  bit is set in the 64-bit set [+0x20, +0x24] and clear in [+0x28, +0x2c]
+  (a raw button: slot 35, 0x00a22d20, ids below 0xabab) or set in
+  [+0x30, +0x34] and clear in [+0x38, +0x3c] (an axis direction: slot 36,
+  0x00a22d80, ids 0xabab..0xabca; the pad's update 0x00a22940 ORs both sets
+  from the poll's buttons and axes, the axes past the device's dead zone
+  [+0xd4]). The check is any bit set in the first word of a pair and clear in
+  the second.
+
+A pass drawn for nothing costs a render; a missed trigger would cost a press,
+so both checks are supersets.
+
+`ISAAC_GATE_INPUT=0` restores the round-93 rule (for measuring). The log says
+`render gate: in-between frame drawn for a keyboard|gamepad press (n so far,
+m skipped)` for the first five and every 50th, and the 1800-skip line counts
+them.
+
+**Tests** (host selftest, `python scripts/recomp/host/build_selftest.py`:
+826 checks, 0 failures; 30 of them new, in `test_input_edges` and the native
+`__index` block). For the gate: the keyboard edge (none down, held, released,
+the last key 0x15c, a value of 2 over 0), the pad edge (each of the four
+words alone, held, one new bit beside a held one, a release), the decision
+(a tick's own pass is drawn and not counted as kept; an in-between pass that
+would be skipped is drawn when a press is in it, counted as drawn and kept and
+not skipped, and its present is paced like any drawn in-between frame; a
+later pass keeps nothing more) and the device walk over a fake input manager
+in guest memory (a key new and held, a pad axis bit new and held, a device
+outside [+8, +0xc) not read, another class not read as a pad, the key arrays
+read only with a keyboard device present, a vector whose size is not a
+multiple of 8 not read). Seven mutants through `scripts/decomp/mutate.mjs`,
+each killed by that selftest: the previous-key test inverted, the key loop
+one short, the pad's second axis word dropped, the rule itself disabled
+(`0 && input_edge`), the pace not set for a kept frame, any vtable taken for a
+pad, the vector-size test dropped.
+
+**Measured on k1** (`.scratch/r111/load_keys.mjs`, a copy of
+`tools/load_probe.mjs` that presses keys or a test pad after the run starts;
+headless Chromium, real GPU; Fiend Folio + StageAPI + the layer from
+`dev_dist.py`; 48 presses 1.65 s apart, each held 150 ms; the counts are
+`lab_trig.lua`'s / `lab_trigpad.lua`'s last report):
+
+| Input | Gate | Load | Presses seen held | Triggered in MC_POST_RENDER |
+|---|---|---|---|---|
+| keyboard F2/F3 | on (k1 rule) | changelog open | 48 | 48 |
+| keyboard F2/F3 | on, `ISAAC_GATE_INPUT=0` (round 93 rule) | changelog open | 48 | 19 |
+| keyboard F2/F3 | off (`ISAAC_RENDER_GATE=0`) | changelog open | 48 | 48 |
+| pad A | on (k1 rule) | CPU x3 | 47 | 47 |
+| pad A | on, `ISAAC_GATE_INPUT=0` | CPU x3 | 47 | 1 |
+| pad A | on (k1 rule) | none (changelog closed) | 48 | 48 |
+| pad A | off | none | 48 | 48 |
+
+"Changelog open": nobody presses C, so Fiend Folio's changelog stays open and
+its text drawing makes the device fall behind (renders 3,000 for 2,760
+updates in the gate-on run: nearly every in-between frame skipped; 1,800 skips
+by 111 s, 24 in-between frames drawn for a press). "CPU x3": C closes the
+changelog first, then the page is throttled three times through CDP
+(`Emulation.setCPUThrottlingRate`) for the presses (renders 1,680 for 1,574
+updates). In the two pad runs under CPU x3 the 48th press came after the
+lab's last report, so 47 of 47. The pad is a page-side stand-in
+(`navigator.getGamepads` answering one standard-mapping pad whose A follows
+the driver), read through the page's own gamepad.mjs and the XInput shim; the
+game adds it as "XInput Controller 1". `lab_trigpad.lua` asks every button
+id 0..31 of controller indices 1..4 and counts a render once when any is
+triggered. Triggered never exceeds presses: nothing is seen twice.
+
+**Fiend Folio's changelog** (`lab_dss.lua`, a fresh browser profile, gate
+on): the menu is open from render 61 ("ff v3.3.2"), C is pressed once at
+render 512 and seen triggered there, and the menu is gone by render 541; F1
+in a second run: seen at render 538, the menu exiting at 541 and gone by 601.
+Screenshots `.scratch/r111/m-on-dssC/shot.png` (open) and `key-1-KeyC.png`
+(closed, the room and "Press [C] to open Dead Sea Scrolls Menu"). The frame
+rate the menu cost: 420 renders in 14.1 s while it was open (29.8 a second),
+480 in 8.0 s after (60).
+
+**The game's own menus** (`lab_pause.lua`: Game():IsPaused() read on every
+render; C first, then Escape 24 times): gate on, CPU x3: 12 openings and 12
+closings, strictly alternating, one per press (and the unpause at the run's
+start); the log shows in-between frames drawn for some of the Escape presses.
+The same with no throttle: 12 and 12. A press seen twice would open and close
+the menu in one press.
+
+#### luabridge's lookup in native code
+
+**Measured** (round 110's profile, `profile_play.mjs` on Fiend Folio with
+StageAPI and the layer, engine h3, 20 s of play): inside Lua entries the
+largest guest function was 0x0085cd40, about 15% of busy time inclusive: the
+`__index` metamethod of every class the game binds (luabridge), run as lifted
+x86 that calls a dozen `imp_lua5_3_3r__lua_*` shims, each through a
+trampoline, `call_guest_cfunction` and `isaac_guest_call`.
+
+**The translation** (`host_lua.c`, section 1c, `lb_index_native`). The body
+(0x0085cd40..0x0085cf30, 191 instructions) is the same sequence of Lua API
+calls made directly on the state, read off the instruction stream branch by
+branch (the comment in the source lists each address):
+
+- `lua_getmetatable(L, 1)` (its result is not tested by the game), then
+  `mt[key]` by rawget; a C function there is the answer (0x0085cd67 ->
+  0x0085ce85: `rotate(-2, -1); settop(-2); return 1`);
+- the loop at 0x0085cd87: a non-nil value that is not a C function throws
+  "not a cfunction" (0x0085ceb0); otherwise `__propget` by rawget, which must
+  be a table ("missing __propget table", 0x0085cef4); a C function at
+  `__propget[key]` is called with the object (`lua_callk(L, 1, 1, 0, 0)`,
+  0x0085cedf) and its one result returned; a non-nil non-function there throws
+  "not a cfunction"; then `__parent`: nil ends the lookup with nil
+  (0x0085ce98 returns the nil on top), a non-table throws "__parent is not a
+  table" (0x0085cf03), a table becomes the class searched next (key by rawget
+  again, 0x0085ce6b; a C function found is returned through 0x0085ce85).
+
+The throws are C++ exceptions (0x0085bf50 builds the exception,
+`_CxxThrowException` 0x00af05eb). Every step before a result is a raw read
+(rawget runs no metamethod; pushstring only interns), so on each way that ends
+in a throw, and when the object has no metatable at all, the native function
+puts the stack back as it came (`settop` to the entry top) and runs the lifted
+function, which throws as the game does. The getter's call is the one thing
+with effects, and it is the same `lua_callk` with the same arguments.
+
+**Where it goes in.** Every guest C function becomes a Lua C function in
+`trampoline_for` (`lua_pushcclosure`, `luaL_requiref`); the one for
+0x0085cd40 is now `lb_index_native` instead of a pool trampoline. It is one
+host address, as the trampoline was, so every closure the game makes of
+0x0085cd40 still compares equal to every other and to nothing else
+(`lua_iscfunction` is true for it, as for the trampoline); the closure's
+upvalues are made by the same `lua_pushcclosure(L, f, n)`, and the function
+reads none (the body has no pseudo-index). The game imports no
+`lua_tocfunction`, so nothing maps a C function back to a guest address. The
+layer's own wrappers of `__index` (probe mode's `wrap_class`, the static
+tables) hold whatever `rawget(c, "__index")` gave them and call it, which
+works the same on either. The fallback needs the guest address, so the
+trampoline call was split into `call_guest_fn(L, fn, slot)`.
+
+`ISAAC_LUA_NATIVE=0` keeps the trampoline (the lifted function, as before);
+`=2` runs both: the native lookup first without calling a getter, then the
+lifted function, whose answer is the one returned, and compares (a getter is
+then called once more natively and its result compared: raw-equal, two NaNs,
+two full userdata with one metatable and the same bytes -- a getter makes a
+new Vector each call -- or two tables). Mismatches are logged (`__index
+MISMATCH #n: key ...`, the first 20) and counted in `__index verify: n lookups
+compared, m mismatch(es); native kinds found a, getter b, nil c, lifted d` at
+1,000, 10,000 and every 200,000.
+
+**Tests.** Host selftest (the same 826 checks): the shim's
+`lua_pushcclosure` of 0x0085cd40 gives the native function and takes no
+trampoline slot; on a luabridge-shaped class (methods in the metatable,
+getters in `__propget`, the base class in `__parent`) a method, a getter
+(called with the object), an inherited method and getter, a missing key and
+a number key are answered natively with one result; five ways go to the
+lifted function (a stand-in here) with the stack as it came: a Lua function
+or a number where a method would be, a base class without `__propget`, a
+`__parent` that is not a table, a getter that is not a C function, and an
+object without a metatable; verify mode compares five lookups (one a value
+userdata that points into itself) with no mismatch, and a differing lifted
+answer is counted and is the one returned. Seven mutants through
+`mutate.mjs`, each killed: the getter handed the key instead of the object,
+a nil `__parent` sent to the lifted function, the non-C-function test after
+the getter dropped, the stack restored one slot high, the `trampoline_for`
+mapping removed, the comparison always "same", and the self-pointer rule of
+the userdata comparison dropped.
+
+**The equivalence over a real session** (k2, `?ISAAC_LUA_NATIVE=2`, Fiend
+Folio + StageAPI + the layer): 2,400,000 lookups compared in 50 s of a run with lab_index.lua, 0 mismatches (found in the class 1,291,603, a getter 1,105,983, nil at the end of the chain 2,414, sent to the lifted function 0); the verify tour below, 5,400,000 compared, 0 mismatches. The first verify run, on k1, reported
+6.7% mismatches, every one of the 20 logged a getter returning a userdata
+(`Position`, `Spawns`): luabridge's value userdata holds a pointer to its own
+storage, so two equal Vectors differ in that word. The comparison was wrong,
+not the lookup; k2's compares such a word by its distance into the block.
+`lab_index.lua` asks, every render for 600 renders: a method of the class
+(`GetName`), a getter (`MaxFireDelay`), a base-class getter through
+`__parent` (`Position`, `Velocity`), a base-class method (`IsDead`), a name no
+class has, a number key, a method the layer added as a C closure
+(`GetActiveMaxCharge`), a Vector's getter, a Room method, and a static
+member; 0 unexpected answers.
+
+**Speed** (`.scratch/r111/prof.sh`: `profile_close.mjs` = `profile_play.mjs`
+pressing C before the window, Fiend Folio + StageAPI + the layer, CPU x1,
+real GPU, 20 s of walking and firing, changelog closed -- checked on each
+run's screenshot; the lifted `__index` (`ISAAC_LUA_NATIVE=0`) and the native
+one alternating on engine k2, 3 runs each; `prof_ab.py` reads the profiles):
+
+| | busy share | `__index` inclusive (ms/frame) | Lua -> guest calls inclusive (`call_guest_fn`, ms/frame) | frames in 20 s |
+|---|---|---|---|---|
+| lifted (`=0`) | 78.0%, 77.2%, 75.3% | 1.01, 0.97, 0.96 | 2.65, 2.63, 2.54 | 1463, 1474, 1507 |
+| native (`=1`) | 75.2%, 72.2%, 75.4% | 0.51, 0.44, 0.53 | 2.07, 1.98, 2.09 | 1454, 1489, 1478 |
+
+`__index` with the getters it calls takes half the time it did, and the time
+under Lua's calls into the game drops by about 0.55 ms a frame. The busy share
+falls by 2.5 points on the means, but the two ranges touch (75.3 and 75.4):
+within this machine's noise. The frame count does not move: the game is
+paced, at about 70 frames a second here either way. No frame-rate gain is
+claimed.
+
+h4 (round 110's engine, the same scene, 3 runs: busy 98.1%, 98.0%, 98.6%,
+26.5 to 28.3 ms a frame) is not a like-for-like "before": its C press was lost
+in all three runs (the round-93 gate, Part 1) and the changelog stayed open
+in every profile (the screenshots), which is exactly what players met. On k2
+the same driver closes it every time; the two fixes together take this scene
+from about 27 ms of work a frame to about 10.
+
+The collector (the per-pass `lua_gc` at 0x008657c0) is a third of busy time
+on k2 with the changelog closed. What the game asks there: LUA_GCCOUNT
+(0x008657d1), the growth since the last pass kept in a ten-pass history at
+[+0x28 + 4i], and a `lua_gc(L, LUA_GCSTEP, n)` every pass (0x008658b0). n is
+[+0x24]: when no pass of the ten shrank the heap and they grew it, n grows by
+a tenth of their sum (at most 10,000) and a 600-pass hold starts; otherwise,
+once the hold is over, n shrinks by a hundredth (at least 10); never below
+50. The collector itself is host C already (Lua 5.3.3);
+making it cheaper means asking it for less, which changes when finalizers
+run: not changed.
+
+**Correctness on k2.** The layer suites (`.scratch/rgon/r110/suites.sh`,
+drive_stress.mjs, the layer packed from this tree): test_hooks4 23 0, test_hooks3 42 0, test_hooks2 49 0, test_layer 49 0, test_layer2 95 0, test_layer3 53 0, test_layer4 49 0, test_gate 7 0 (on k1 test_hooks2 once read 49 2 while another browser ran beside it -- the player walked into a neighbouring room during its 60-frame wait, "3 3 3", a timing check that has failed before in another form; alone on k1 it read 49 0 twice, and on k2 49 0). A Fiend Folio
+tour (`drive_stress.mjs phases=tour`, `?ISAAC_RGON_ALLOW=fiendfolio-reloaded`)
+in the native mode: 0 stops, 0 Lua error lines, 74 callbacks reported as not implemented (as round 110); in verify mode: 0 stops, 0 Lua error lines, 5,400,000 lookups compared, 0 mismatches. `node --test
+tests/recomp-rgon.test.js tests/recomp-host.test.js
+tests/recomp-insn-hooks.test.js`: 50 pass, 0 fail, 5 skipped (the audit
+outputs, as before). `lift_patches.py --check`: 0 TUs to change.
+`check-repo-safety.mjs` passed.
+
+**Not done, and why.**
+
+- The pad's third way to a trigger (the ids 0xcdcd/0xcdce, slot 37
+  0x00a1f930, a record list read through slot 25 0x00a1f0e0) is not read by
+  the gate: what fills that list was not traced. A press of those ids in a
+  skipped frame can still be lost. Every other pad button and axis direction
+  is covered, and the keyboard fully.
+- The pads were tested through a page-side stand-in (`navigator.getGamepads`),
+  not a real controller; the analog sticks and triggers were not pressed in a
+  test (the axis bits are in the selftest only).
+- The gate draws a pass for a press only in a Game (the gate itself does
+  nothing outside one). Its cost, one render per press on a device that is
+  behind, was not measured separately in game speed.
+- Part 2 replaces `__index` only. The class checks 0x0085c590 / 0x0085c3e0
+  (about 5% of busy time; `sub_0085c590` 0.55-0.60 ms a frame on k2) and
+  `__newindex` 0x0085cf30 are still lifted: the checks take ECX/EDX and stack
+  arguments (an LTCG convention) and a replacement must leave ECX, EDX and
+  the flags as every caller expects, which needs a census of what their
+  callers read after the call; `__newindex` calls a setter, so a verify mode
+  cannot run both sides the way `__index`'s does.
+- The collector's per-pass step (a third of busy time) is left as the game
+  asks for it.
+- No frame-rate gain is claimed for Part 2: the busy share moved by about
+  the run-to-run spread. The changelog's close (Part 1) doubled the frame
+  rate while it would otherwise have stayed open (29.8 -> 60 renders a
+  second in the lab_dss run).
+
+### 21.141 Round 112: a mod's named achievements lock the game's own content
+
+Layer (`api_data.lua`: the layer's save file and the named-achievement fields;
+`api_hooks.lua`: five always-armed handlers; `api_innate.lua` moved onto the
+save file; `rgon.lua`: `T.ALWAYS`), engine (`RGON_HOOKS` slot 169 and
+`RGON_INSN_HOOKS` slot 170 in `lift_patches.py`, from `tools/hook_table.py`),
+tests (`test_ach.lua` with the content mod `tools/test_ach_mod.mjs` makes), lab
+scripts (`lab_ach.lua`, `lab_menu.lua`). Engine `m1` (k2 plus slots 169 and 170;
+its host objects were built from the working tree of the time, which held
+round 113's uncommitted host_lua.c change).
+
+A player's screenshot of Fiend Folio's character select page for Friend showed
+"UNLOCKED BY BLASTING AN ARCADE POSTER ..." drawn over the hearts and item
+names: the page drew every layer of the mod's menu sprite, and the character
+could be started although its `achievement="FF_FRIEND"` was never unlocked.
+
+#### What REPENTOGON does (its source, for the facts only)
+
+- `XMLData.cpp` `ParseModdedXMLAttributes`: before the game parses items.xml and
+  pocketitems.xml, a non-numeric `achievement=` of each top-level node is
+  replaced by the mod achievement's id (`SingleValXMLParamParse`); in
+  challenges.xml `achievements` (a comma list) and `unlockachievement`
+  likewise. players.xml is not translated. Entries whose id is past the game's
+  (641 in v1.9.7.12) are kept as `customachievitems` for collectibles,
+  trinkets, cards and pills.
+- `AchievementsStuff.cpp` `ItemPool::Init` hook: for each such entry, the
+  config's `achievementId` is set to -1 when the achievement is unlocked and to
+  its id when not, then the pools are built. `PersistentGameData::Unlocked`
+  answers a mod achievement (id >= 641) from its own table; `TryUnlock` of one
+  refuses while the data is read-only, records it and saves
+  `achievements<slot>.json` (keyed by name + mod), shows a paper popup through a
+  borrowed game achievement; `SetSaveSlot` loads that file; `lockachievement`
+  and `achievement` console commands.
+- `XMLPlayerExtras.cpp`: `IsCharacterUnlockedRgon` reads players.xml's
+  `achievement` (a number, else a name; an unknown name is Unlocked(-1), true);
+  `hideachievement` stands in for a missing `achievement`, and keeps a modded
+  character off the menus until unlocked (`LoadPlayers` clears the hidden flag
+  of such a player; a patch in `Menu_Character::Reset`; a tainted character
+  follows its non-tainted one). Its `RenderCustomCharacterMenu` hook shows the
+  twelve item and stat layers of the mod's menu sprite and hides "Unlocked By"
+  when unlocked, the other way round when not, and clears the menu's
+  `IsCharacterUnlocked` (+5). The wheel's portrait is drawn with layer 0 at
+  frame 1 while locked. `SelectRandomChar` and the co-op wheel skip locked
+  modded characters.
+- No entity, baby or other kind is gated. Since v1.1.1 (its changelog) mods'
+  `resources-repentogon` and `content-repentogon` are read in preference to
+  `-dlc3` and the plain folders.
+
+#### What the engine does here (each with its evidence)
+
+| What | Where, evidence |
+|---|---|
+| `achievement=` parsed with atoi | players 0x006998d0 (`call [atoi]` 0x0069a827, LoadPlayers by its strings), collectibles/trinkets 0x00725570 (0x0072620d, stored `mov [edi+0x50], eax` 0x00726216), cards/pills 0x0072cff0 (0x0072d308, 0x0072d35e). A name gives 0 |
+| Unlocked 0x00929aa0 | -2 false; negative true (0x00929aad); >= 0x282 false (0x00929aba); 0 true (0x00929abe); else the byte at [pgd+0x38+id] |
+| inlined copies of that test | `cmp reg, 0x282` occurs 26 times in .text (18 `cmp eax`, 5 `cmp ecx`, 3 `cmp edi`; `pequery.py sig`), e.g. Menu_Character::UpdateRotations 0x0094d585, SelectRandomChar's 0x0094df45: a wrapper of 0x00929aa0 alone would not reach them |
+| TryUnlock 0x00929a20 | no upper bound: `cmp byte [edi+esi+0x38], 0` (0x00929a37) and `mov byte [edi+esi+0x38], 1` (0x00929a44); refuses while [pgd+1] (read-only) is set (0x00929a2a) |
+| player configs | EntityConfig = g_Manager+0x2a670 (LoadPlayers' `this`, 0x008f4178); vector at +8/+0xc, 0x148 each; achievement +0xe8 (Menu_Character_Entry::IsCharacterAvailable 0x00946d10; lab: every game character holds its players.xml number, -1 without one, Fiend Folio's 0); hidden +0x128 (Reset 0x009491a7 leaves such a character off the wheel; the tainted pairing 0x0069d290, called from LoadConfigs 0x008f468d, skips it too); menu sprite +0x134, portrait sprite +0x138 (lab: shared by a mod's characters, one for normal, one for tainted) |
+| item, card, pill entries | the game's Lua registration binds `Item.AchievementID` = +0x50, `Card.AchievementID` = +0x4, `PillEffect.AchievementID` = +0x4 (bindings-17.json: `push` of the offset at 0x00867f3f, 0x00867c51, 0x00867da3); lab: every one of the game's entries matches its XML |
+| pools | the pool set-up 0x0073635f reads [item+0x50], Unlocked() on it, and marks the pool entry available or not (once per run start) |
+| challenges | Manager::GetChallengeParams 0x009569a0 (sig): g_Manager+0x2a664, 0xa4 each, index = id; the needed achievements a vector<int> at +0x48 (lab: every game challenge matches challenges.xml; Fiend Folio's hold [0]). The game has no `unlockachievement` (no such string in the image) |
+| the character menu | Menu_Character::Update calls the input step 0x0094c580 then UpdateRotations 0x0094d500 (0x00949e69, 0x00949e70) every menu frame; the input step starts a run only with [menu+5] set (0x0094c613); UpdateRotations sets [menu+5] from IsCharacterAvailable for a game character (0x0094d64a..0x0094d657, and hides layers 4..15 of the vanilla page) and to 1 for a mod's (selected id >= 0x12, 0x0094d700). The page render 0x0094bbd0 draws a mod's page through 0x008f8d00 (static: playerType, pos, the vanilla sprite; plays the name on [cfg+0x134] and draws every layer), with playerType = map[id-0x12] of g_ModCharacterMap 0x00c79884, the tainted half while [menu+0xdb4] != 0 (0x0094bc41..0x0094bc58). REPENTOGON's signature for RenderCustomCharacterMenu matches 0x00a54150 here, which is something else (a strtoull), and its three ASM signatures for that function match nothing |
+| the wheel's portrait | 0x008f8860 (playerType [ebx+8]; plays the name on [edi+0x138] by 0x008f89c4, draws after); called by the wheel 0x0094c445 (returns to 0x0094c44a) and by 0x00982100. ANM2::SetLayerFrame 0x0040a7e0 (the Lua registration's `push 0x40a7e0` for Sprite.SetLayerFrame, 0x008673f1) |
+| hooks armed late | the layer starts inside the first ModManager::LoadConfigs, so that call's post-hook never runs (the wrapper tests the slot on entry): MC_POST_MODS_LOADED never fired on a first boot, before and after this round |
+
+#### The design
+
+- **The engine's own test answers.** After every mod's content is loaded, the
+  layer finds every entry whose `achievement` (or `hideachievement`, or a
+  challenge's `achievements` piece) names a mod achievement, and writes
+  REPENTOGON's values into the field the game tests: -1 while unlocked, the
+  achievement's id (0x282 up) while locked. It writes again for that
+  achievement's entries whenever one is unlocked or locked (TryUnlock, Unlock,
+  `achievement`/`lockachievement`, a save slot's file read). A player with
+  `hideachievement` gets its hidden flag set while that achievement is locked.
+  A field is written only while it holds 0, -1 or that id. Nothing calls Lua
+  when the game tests an entry: the item pools, the challenge menu and the
+  wheel's own checks read memory. Fiend Folio: 326 fields and 8 hidden flags.
+  This covers what REPENTOGON gates: collectibles, trinkets, cards and runes,
+  pill effects (as its ItemPool::Init), characters, challenges. As with
+  REPENTOGON the pools take an unlock at the next run start.
+- **When.** The entries are found at the first save-slot choice (or the first
+  character-menu frame), and again when LoadConfigs returns (a reload of the
+  mods).
+- **The character menu** (slot 169, after UpdateRotations, every menu frame):
+  for the selected entry of the mod map, the layer decides "unlocked" as
+  REPENTOGON's IsCharacterUnlockedRgon does (from players.xml), sets the twelve
+  layers' and "Unlocked By"'s visible bytes (+0x74 of each layer state, found
+  by name once per sprite) and clears [menu+5] when locked. The sprite is
+  shared, so it is set for the selected page each frame; the input step reads
+  [menu+5] on the next frame.
+- **The portrait** (slot 170, instruction hook at 0x008f89c4): SetLayerFrame(0,
+  1) for a locked character on the wheel's call, (0, 0) otherwise.
+- **The game's TryUnlock** asked for an id from 0x282 up is answered by the
+  layer (its pre-handler, slot 31, now always armed): nothing past the array is
+  written. No path of the game's makes such a call today (the fields that hold
+  a mod's id are tested, not unlocked), so this is a guard.
+- **Persistence.** The layer's save file is the save data of its own mod
+  (`REPENTOGON (browser)`, per save slot, through SaveModData/LoadModData,
+  which persist over a reload since round 31), now in sections (`rgon-save 1`,
+  `== achievements`, `== innate`; the innate items' file of round 104 is read
+  as the innate section). Unlocked mod achievements are kept by mod folder and
+  name, read at each SetSaveSlot before MC_POST_SAVESLOT_LOAD runs, written
+  once after its functions (Fiend Folio syncs ~300 there), and at once after
+  any later change. `T.achievements_changed` was called before this round but
+  defined nowhere: nothing was kept. HasModData answered false for the layer's
+  written file in a dev_dist instance tree while LoadModData read it back
+  (lab), so the layer reads with LoadModData alone.
+- **Always armed** (`T.ALWAYS`, a pseudo callback id that is always
+  "listening" and never counted as implemented): SetSaveSlot, TryUnlock,
+  LoadConfigs, UpdateRotations and the portrait hook. The cost outside menus is
+  the TryUnlock handler on a game unlock.
+
+**Fiend Folio decides what is unlocked itself.** It keeps its achievements in
+its own save data and syncs REPENTOGON's to them (`ffscripts/achievements/
+repentogon.lua`): on MC_POST_SAVESLOT_LOAD (TryUnlock or `lockachievement` for
+each, by its own record; Bonus/Joke character settings) and whenever it saves.
+Its item unlock tests (`utilities.lua`) read `AchievementID` and fall back to
+the XML name, so they agree with the fields here. On a fresh profile only
+FF_FIENDISH_FOES is unlocked (lab): every Fiend Folio character, Fiend
+included ("beat one Fiend Folio boss"), is locked, and Inaba and the bonus
+characters are hidden, which is what a fresh REPENTOGON player sees.
+
+**content-repentogon.** Fiend Folio ships only `content-repentogon/` (no
+`content/`). The game here reads only `/content/` (the one such string in the
+image). `dev_dist.py` and the page's mod packer (`modpack.py`) list each
+`content-repentogon/` file again under `content/` unless `content/` has that
+file; REPENTOGON prefers `content-repentogon` over `content-dlc3` over
+`content`, and `resources-repentogon` over `resources-dlc3` over `resources`,
+which the port does not do (a mod with both folders gets its plain file here;
+`resources-repentogon` and the `-dlc3` folders are not read). Not changed: no
+mod in use needs it, and the alias is not conditional on the layer. The
+layer's own XML reading takes `content-repentogon` first.
+
+#### Tests
+
+`test_ach.lua` (drive_stress.mjs phases=custom with the layer and the content
+mod `tools/test_ach_mod.mjs` makes: four named achievements, a character
+locked by one, a hidden one shown by another, a collectible in the treasure
+pool and a trinket, a card and a pill effect, a challenge), 24 checks over a
+page reload: on a fresh profile none is unlocked; each entry holds its
+achievement's id (read through the game's own Lua members `AchievementID` and
+EntityConfigPlayer:GetAchievementID/IsHidden); the hideachievement character
+is hidden; the game's own entries keep their numbers (Magdalene 1, Isaac -1,
+Dr. Fetus 11); the treasure pool with every other collectible taken out hands
+out Breakfast, never the locked collectible; TryUnlock unlocks, fires
+MC_POST_ACHIEVEMENT_UNLOCK once with the id, a second answers false, and the
+collectible and trinket then hold -1; the hidden character is shown and hidden
+again; Unlock and `lockachievement` move the card and the pill; the console's
+`achievement <id>` and `lockachievement <id>` move the character; after
+`restart` the pool hands the unlocked collectible out; after a page reload
+(the walk's KEYS reload, the run continued) the unlocked one is still unlocked
+and the others locked, the fields say so, and the pool still hands it out.
+On k2 (layer only, no engine change) and on m1: 24 0.
+
+Twelve layer mutants through `scripts/decomp/mutate.mjs`
+(`.scratch/r112/mutants.sh`, test_ach on m1), each killed: the unlocked value
+-1 written as the id (6 checks), the collectible field at +0x54 (5), the
+player field at +0xec (the Magdalene check: the test reads the field through
+the same offset, so only the game's own number shows it), the card/pill field
+at +0x8 (5), the hidden flag inverted (4), the save written under another
+section name (the 3 after-reload checks), MC_POST_ACHIEVEMENT_UNLOCK not fired
+(2), a second unlock answering true (1), `lockachievement` doing nothing (6),
+the console's `achievement` gone (1), PersistentGameData:Unlocked inverted for
+a mod's achievement (9), every mod achievement numbered 641 (12). Two checks
+are the fixture's own and no mutant was aimed at them: "the test content is
+there" and "a game's collectible keeps its own number".
+
+The character menu (`.scratch/r112/menu_keys.mjs`, `lab_menu.lua`, the Fiend
+Folio dist on m1, a fresh browser profile; menu 5 is the character menu, the
+selected-menu id at g_MenuManager+0x40 measured by the lab): the wheel turned
+to Friend (selected id 20 = mod entry 2 = player type 45) reads
+`unlocked=false menu+5=0 unlockedby=1 itemname=0`, its page shows only the
+"Unlocked By" text (`.scratch/r112/menu3/page-before.png`), Enter starts no
+run; `lab_menu.lua` unlocks FF_FRIEND through PersistentGameData:Unlock after
+240 menu frames: `unlocked=true menu+5=1 unlockedby=0 itemname=1`, the normal
+page with hearts, stats and "her trusty revolver"
+(`page-unlocked.png`), the wheel's portrait changes from frame 1 to frame 0,
+and Enter on that page starts a run (`run.png`). `.scratch/r112/mut_menu.sh`
+checks the locked page and the refused Enter: clean, it passes; two mutants
+through mutate.mjs, both killed: [menu+5] not cleared (`menu+5=1`, "a run
+STARTED"), the twelve layers not set (`itemname=1`). The portrait has no
+mutant (screenshots only).
+
+Original behaviour: the eight layer suites on m1 with the layer alone
+(`.scratch/rgon/r110/suites.sh`, no content mod): test_hooks4 23 0, test_hooks3
+42 0, test_hooks2 49 0, test_layer 49 0, test_layer2 95 0, test_layer3 53 0,
+test_layer4 49 0, test_gate 7 0. The plain dist on m1 (no mod at all) boots, a
+run starts as Isaac (`.scratch/r112/plain-menu/key-6-Enter.png`), and a game
+character locked on a fresh profile stays locked: Eden's page reads "LOCKED"
+and Enter starts nothing (`.scratch/r112/plain-menu2/key-7-Enter.png`).
+Fiend Folio tour (drive_stress.mjs phases=tour, Fiend Folio + StageAPI + the
+layer from dev_dist.py, m1): 0 stops, 0 Lua error lines, 74 callbacks reported
+as not implemented (as round 111); the layer found 326 fields and 8 hidden
+flags. Host selftest 840 checks, 0 failures (it includes round 113's
+uncommitted lua_gc work in host_lua.c, not this round's). `node --test
+tests/recomp-rgon.test.js tests/recomp-insn-hooks.test.js
+tests/recomp-host.test.js`: 50 pass, 0 fail, 5 skipped. `lift_patches.py
+--check`: 0 TUs to change. `check-repo-safety.mjs` passed; `git diff --check`
+clean.
+
+#### Not done, and why
+
+- REPENTOGON's achievement popup (the paper with the mod's gfx) is not shown.
+- challenges.xml `unlockachievement` (REPENTOGON's own challenge completion
+  unlock) is not done: the game has no such attribute. REPENTOGON's custom
+  challenge menu for modded challenges is not reproduced; the game's own
+  challenge menu reads the rewritten list (not checked in a screenshot).
+- SelectRandomChar (0x0094de50) counts every mod entry as a candidate: a random
+  pick can land on a locked mod character (the start is then refused, [menu+5]
+  = 0). The co-op wheel was not checked.
+- `hideachievement` given as a number is evaluated when written, not again when
+  that game achievement changes outside TryUnlock.
+- A tainted mod character whose non-tainted half is hidden by `hideachievement`
+  in the XML is not re-paired: the game's pairing (0x0069d290) runs inside
+  LoadConfigs before the layer clears the flag (REPENTOGON clears it in
+  LoadPlayers). No Fiend Folio character is in that case.
+- The layer's TryUnlock unlocks a mod achievement while the game's data is
+  read-only (REPENTOGON's refuses): test_layer2.lua checks the layer's old
+  behaviour in such a run (the debug console was used).
+- EntityConfigPlayer:GetAchievementID returns the field, so -1 or the id for a
+  named one, where REPENTOGON's returns 0 (it does not rewrite players).
+
+### 21.142 Round 113: the game's collector steps, paced
+
+Engine (`isaac_lua_gc` and its three pure rules in `host_lua.c`, behind the
+`lua_gc` shim; `host_lua_gcstate.c`, the one read of Lua's private state),
+tests (`selftest.c`, the "gc" block), lab scripts (`lab_gc.lua`,
+`lab_alloc.lua`, `lab_alloc2.lua`), the page's FPS readout
+(`menu_overlay.mjs` `sampleReadout`, `play.mjs`). No lift patch.
+
+**The report.** A player with Fiend Folio: "still super laggy and I feel
+like the fps counter is lying to me". Both were true. The readout counted
+frames handed to the browser, which stays near 60 while the game hitches and
+while its logic falls behind (it now also says the game's speed when that is
+under 95%: `tests/recomp-web.test.js`). And measured with `perf-run-ff.mjs`
+(a rAF timestamp and a setter on `window.isaacFrame`; the first room, nothing
+pressed, the changelog closed, CPU x1): 70 frames over 25 ms in 20 s, one
+every 0.3 s, with the readout at 60.
+
+**Why.** Once per pass of main's loop (0x009312ff, after the render call) the
+game runs 0x008657c0 on the Lua engine at [0x00c71690]:
+
+- `lua_gc(L, LUA_GCCOUNT, 0)` (0x008657d6, L = [engine+0x18]); the growth
+  since the last pass goes into a ten-entry ring at [engine+0x28 + 4i] (index
+  [engine+0x50] mod 10, last count [engine+0x58]).
+- If none of the ten entries is negative and their sum is positive
+  (0x0086583b..0x00865841): n = min([engine+0x24] + sum/10, 10,000) and a
+  hold of 600 passes starts ([engine+0x54] = 0x258). Otherwise the hold
+  counts down, and once it is over n shrinks by max(n/100, 10).
+- n is never below 50 (0x0086589d), is stored at [engine+0x24], and
+  `lua_gc(L, LUA_GCSTEP, n)` is called (0x008658b0). The game's other calls
+  of `lua_gc` are counts and whole collections (0x00872102, and three
+  register-held sites pushing 2, 3 and 4); it never sets the pause or the
+  step multiplier.
+
+Lua 5.3's LUA_GCSTEP adds n KB to the collector's debt and runs the collector
+while the debt is positive. A cycle's mark phase only allocates, so with a
+heap big enough that marking takes ten passes the rule above always fires:
+with Fiend Folio n was 10,000 within the first 120 renders of a run and
+stayed there (`lab_gc.lua`). At 10 MB of debt a pass, the pause Lua leaves
+after a cycle is over in a few passes, and a 91 MB heap was marked and swept
+again and again, a cycle for every 1 to 7 MB of garbage. The collector was
+31% of the busy time of a profile, and each cycle's end a frame of 40 to
+60 ms.
+
+Three things about Lua's own accounting made a simple "wait longer between
+cycles" wrong, each found by measuring an engine that did only that:
+
+- LUA_GCSTEP answers 1 only when a cycle ends inside that very call. A cycle
+  the game's steps began is often ended by one of Lua's own steps (at an
+  allocation, while the debt is positive); a wrapper that waits for the 1
+  then drives a second cycle straight after the first. Whether a cycle is in
+  progress is read where Lua keeps it (`host_lua_gcstate.c`).
+- Lua counts a swept object, and a finalizer call, as about six bytes of
+  work. One step of a megabyte therefore sweeps the whole heap: with 25 to
+  40 MB of garbage waited for, that was 40 MB freed in one pass, 150 to
+  200 ms (`lab_gc.lua`'s spike lines). A step is now made in slices and
+  stops on the clock.
+- The longest stops (130 to 400 ms) were finalizers, round 114.
+
+**The change.** With `pct` = 25 (`ISAAC_GC_DEFAULT_PCT`, `?ISAAC_LUA_GC=<pct>`,
+0 = every step as the game asks and nothing below):
+
+- Between two cycles a step the game asks for is not made until the heap has
+  grown by pct percent of what it was when the last cycle ended, at most
+  32 MB (`isaac_lua_gc_defer`, `isaac_lua_gc_room`). Lua's own pause is set
+  to 100 + pct, so its allocation-driven steps begin the next cycle at about
+  that point.
+- From there the game's steps are made until the cycle ends, whoever ends
+  it, each no larger than a 128th of the heap plus three times what the heap
+  grew by since the last pass (`isaac_lua_gc_step_kb`); a heap that has
+  outgrown twice the allowance is stepped by as much as the game asks.
+- A step is made in slices of 16 KB and stops when the pass has spent 2 ms on
+  it (8 ms past twice the allowance; `?ISAAC_LUA_GC_MS=<ms>`).
+- The game's own state is untouched: it reads the count, keeps its ring and
+  n, and asks every pass. Counts and whole collections are made as asked.
+
+What it changes for the game: when a `__gc` runs (later) and how big the Lua
+heap gets (with Fiend Folio's changelog open, which makes 700 KB of garbage a
+render and more in one function, `dssmenucore.lua:3012`: 93 to 132 MB in
+place of 91 to 98; with it closed, about 65 KB a render, 93 to 120 MB;
+`lab_gc.lua` on engine n3).
+
+**Measured.** With round 114, below.
+
+**Correctness.** Selftest, the "gc" block: the three rules, and the wrapper on
+a real state with Lua's own collector stopped (waits, steps past the
+allowance to the cycle's end, a cycle someone else ended, a cycle someone
+else began, the spread step that begins a cycle and does not finish it, the
+slices, the clock). 18 mutants through `mutate.mjs` with the selftest as the
+command (`.scratch/r113/mutants2.sh`): 17 killed; the one survivor was a
+branch that noted a whole collection as a cycle end, which the next step
+sees for itself: the branch is removed, and the other 17 are killed again on
+the final code.
+
+### 21.143 Round 114: a finalizer that does nothing is not called, and not kept
+
+Engine (`host_lua.c` 1d `lb_gc_native`, 1e `isaac_lua_setmetatable`;
+`host_lua_gcstate.c` `isaac_lua_setmetatable_nofin`), tests (`selftest.c`,
+the "native __gc" and "no-finalizer" blocks). No lift patch. The evidence
+below is a census over the whole image with `pequery.py` (decode config
+linear+skipdata+jtab-mask v2 (+fld), capstone 5.0.7, 2,082,541 instructions,
+373 resync bytes).
+
+**What was measured.** After round 113's pacing the longest stops remained:
+130 to 400 ms, once per collection cycle. A profile put them under Lua's
+`GCTM`: the `__gc` of every userdata the game hands to Lua. A two-minute
+Fiend Folio tour runs 11 million of them, each a call into lifted code, and
+Lua runs them in batches that double in size with every step (lgc.c
+`runafewfinalizers`), so the last batches of a cycle are hundreds of
+thousands of calls in one uninterruptible step.
+
+**The `__gc` functions.** 66 functions of one 31-byte shape (56 at
+0x008c2bd0..0x008c32b0 and 10 at 0x008c5b90..0x008c5cb0, stride 0x20; the
+byte pattern has 66 hits and 0x0085c3e0 has 66 direct callers, the same 66;
+they differ in the key they push and the call's displacement):
+
+    push ebp; mov ebp, esp; mov ecx, [ebp+8]; push key; call 0x0085c3e0
+    add esp, 4; mov ecx, eax; mov edx, [eax]; push 0; call [edx]
+    xor eax, eax; pop ebp; ret
+
+`sub_0085c3e0(L, key)` is the exact-class check used only by these 66: the
+class table `registry[key]`, the object's metatable, `mt[0x00c7f4b8]` a
+boolean, the two tables raw-equal or `class["__const"]` raw-equal to the
+metatable; it returns the userdata block, and on a mismatch raises
+`luaL_argerror`. Each `__gc` is registered twice (132 `push imm32` sites, on
+the class table and on its const table).
+
+**The destructors.** RTTI gives 36 luabridge Userdata vtables (34
+`UserdataValue<T>`, `Userdata`, `UserdataPtr`), each with the one slot, and
+18 distinct slot-0 functions. For 29 vtables (11 functions) the body is,
+but for the size pushed and the call's displacement,
+
+    push ebp; mov ebp, esp; test byte [ebp+8], 1; push esi; mov esi, ecx
+    mov dword [esi], 0x00b753c0
+    jz +N; push size; push esi; call 0x00aef15c; add esp, 8
+    mov eax, esi; pop esi; pop ebp; ret 4
+
+which, called with 0 as the `__gc` calls it, only stores the base vtable
+into the object. These are `UserdataPtr` (every pointer to a game object:
+202 construction sites under 85 keys), Vector, Color, KColor, EntityRef,
+RNG, ProjectileParams, TearParams, BitSet128, PosVel, QueueItemData,
+GridEntityDesc, and the enum and array-proxy values. The other 7 do work:
+EntityPtr (`LuaEntityRef`), Sprite (`ANM2`), Font, FontRenderSettings,
+PathFinder, EntityList, HomingLaser. Nothing reads an object's vtable word
+but the `__gc`'s own `call [edx]`: all 328 xrefs to the 36 vtables are
+stores, the vtables have one slot, the 937 callers of the ordinary check
+0x0085c590 use `[eax+4]`, and nothing refers to the type descriptors. (Not
+provable from the index: that no register-held `call [reg]` elsewhere is
+ever applied to such a block.)
+
+**The change, in two layers.**
+
+- 1d. A `__gc` of that shape, for an object whose slot 0 is that body and
+  that passes 0x0085c3e0's own check, is the check and the one store, made
+  by host code. Anything else runs the lifted function. Both shapes are read
+  off the guest image (when a `__gc` is first registered, when a vtable is
+  first seen), so a build whose bytes differ takes the lifted path.
+- 1e. When the game sets a class table on such an object -- the table's
+  `__gc` one of the 66, the table that key's class table or its const table
+  -- the metatable is set without Lua's finalizer mark (lapi.c
+  `lua_setmetatable`'s userdata case less `luaC_checkfinalizer`). The object
+  is then collected like a string: no call, and its memory back in the cycle
+  it died in, not the next. An object of another destructor, or one
+  constructed after its metatable was set, keeps the mark and takes 1d's
+  way.
+
+`?ISAAC_LUA_NATIVE=0` runs the lifted `__gc` for everything; `=2` runs it too
+and checks that it returned nothing and left the store the native path would
+have made; `?ISAAC_LUA_NOFIN=0` marks everything as Lua does.
+
+**Measured** (`.scratch/r114/pace_ab.sh`: `perf-run-ff.mjs`, Fiend Folio +
+StageAPI + the layer on engine n3, the changelog closed, CPU x1, real GPU,
+20 s after 8 s of warm-up; the old behaviour (`ISAAC_LUA_GC=0`,
+`ISAAC_LUA_NATIVE=0`) and the build's defaults alternating, two runs each):
+
+| | game steps a second | frames over 25 ms | over 50 ms | longest frame | 95th percentile | CPU a step |
+|---|---|---|---|---|---|---|
+| first room, standing: before | 31.3, 31.2 | 70, 70 | 1, 2 | 63.5, 53.9 ms | 38.3, 40.3 ms | 20.0, 18.5 ms |
+| first room, standing: now | 30.1, 30.0 | 2, 1 | 0, 0 | 27.5, 25.6 ms | 20.3, 19.9 ms | 14.1, 13.2 ms |
+| 60 enemies, firing: before | 24.8, 25.9 | (every frame) | 68, 60 | 86.9, 78.3 ms | 70.9, 71.6 ms | 40.1, 38.6 ms |
+| 60 enemies, firing: now | 28.5, 29.0 | (every frame) | 40, 29 | 116.4, 87.8 ms | 52.3, 50.0 ms | 35.0, 34.4 ms |
+
+The plain game in the same first room, for scale: 5.0 ms of CPU a step. The
+fight is still short of the 30 steps a second (33.3 ms a step): 57% of its
+busy time is Lua's interpreter running the mod's own code (`luaV_execute`
+23%, `luaH_get` 11%, `luaD_precall` 6%), untouched here.
+
+**Correctness.** Selftest 876 checks, 0 failures (the two shapes and their
+near misses written into guest memory; the class, its const table, another
+class, a table that only borrows a class's `__gc`; the collector's own
+calls; the three modes). 19 mutants through `mutate.mjs`
+(`.scratch/r114/mutants.sh`): all 19 killed. On engine n3: a Fiend Folio
+tour with `ISAAC_LUA_NATIVE=2`, 11,000,000 finalizers compared with the
+lifted `__gc`, 0 mismatches (3,333 went to the game alone), and 6,600,000
+`__index` lookups, 0 mismatches; the tour with the defaults, 0 stops and 0
+Lua error lines. The layer suites (`suites.sh`, drive_stress.mjs):
+test_hooks4 23 0, test_hooks3 42 0, test_hooks2 49 0, test_layer 49 0, test_layer2 95 0, test_layer3 53 0, test_layer4 49 0, test_gate 7 0, and round 112's test_ach 24 0.
+
+**Not done.** The Lua interpreter itself. A phone. A run longer than a tour
+(the heap over an hour of play). The mark that 1e leaves out is Lua-internal
+state reached through Lua's own headers: a different Lua version needs that
+function read again.
+
+### 21.144 Round 115: a callback list walked through an index
+
+Layer only (`api_callbacks.lua`), tests (`test_cb.lua`, a new suite), lab
+scripts (`lab_cbsize.lua`). No engine change: it ships as the layer mod.
+
+**What was measured.** With rounds 113 and 114 in, a 60-enemy fight with
+Fiend Folio was still short of full speed (28.3, 28.6 and 25.8 game steps a
+second), and 57% of its busy time was Lua's interpreter. `lab_prof.lua`
+(milliseconds per callback, around the layer's runner) put the per-entity
+callbacks on top: MC_NPC_UPDATE 66 microseconds a call, MC_POST_PROJECTILE_UPDATE
+79, MC_POST_EFFECT_UPDATE 42, each fired tens of thousands of times a
+minute. `lab_cbsize.lua` says why: Fiend Folio has 250 functions on
+MC_NPC_UPDATE of which 6 run for every entity and the rest are for one
+entity type each (157 types); MC_POST_EFFECT_UPDATE 252 and 1;
+MC_POST_ENTITY_REMOVE 390 and 8; 56 lists have 20 functions or more. The
+runner (the layer's, as REPENTOGON replaces the game's `_RunCallback`; the
+game's own is the same loop) asked the list's rule of every entry at every
+firing: a Lua call per entry, 250 of them to find the 6.
+
+A stronger build of Lua itself was tried first and measured: the library at
+`-O3 -flto` in place of `-O2` (`.scratch/r115/lua_variant.py`, engine
+`n4lto`), the same fight, three alternating pairs against engine n3: 36.1,
+36.3, 38.7 ms of CPU a step against 35.9, 35.9, 40.9. No difference; not
+kept. (Do not re-open without a new idea: the interpreter's time is the
+mod's table lookups, `luaH_get` and `luaV_execute`.)
+
+**The change.** For a firing with a plain parameter (a string, or a number
+other than -1 and NaN) and no second parameter, on a list whose metatable is
+main.lua's own (`defaultCallbackMeta`, the one metatable every list gets,
+with the rule `not a or not b or a == -1 or b == -1 or a == b`), the entries
+that rule accepts -- no parameter, -1, or that parameter -- are found once,
+with their places, in list order, and kept per list and parameter. A firing
+then walks those. What is handed out, and in what order, is the plain walk's:
+
+- A kept index is dropped when the list changes: `Isaac.AddPriorityCallback`,
+  `Isaac.RemoveCallback` and `_UnloadMod` are wrapped, the lists' metatable
+  gets a `__newindex` (an entry put at a new place by anything:
+  `table.insert`'s last store, `list[#list + 1] = e`), and the list's length
+  is compared at every firing.
+- Every entry is checked to be the one still at its place before it is
+  handed out. If it is not, or the list changed since the walk began (a
+  function removed itself, added another), the walk goes on plainly from the
+  entry after the last one handed out: exactly what the plain walk, reading
+  the live list with a rising index, does.
+- What cannot be seen is an entry stored over another by hand at a place the
+  index does not look at, or an entry's `Param` changed in place. Every 256th
+  use of an index it is found again from the list, and a difference drops
+  every index and is logged once. So such an edit is seen within 256 firings
+  of that parameter, not at once: the one known difference from the plain
+  walk.
+
+No parameter, -1, two parameters (`RunCallbackWithTwoParams`), and a list
+with a rule of its own are walked plainly as before.
+`?ISAAC_RGON_CBINDEX=0` walks everything plainly.
+
+**Measured** (`.scratch/r114/pace_ab.sh` on engine n3, Fiend Folio, CPU x1,
+20 s, the plain walk and the index alternating):
+
+| | game steps a second | frames handed over a second | CPU a step |
+|---|---|---|---|
+| 60 enemies, firing: plain walk | 28.3, 28.6, 25.8 | 28.3, 28.6, 25.8 | 35.1, 34.8, 38.7 ms |
+| 60 enemies, firing: index | 29.7, 29.9, 29.4 | 34.8, 38.1, 32.9 | 33.5, 33.4, 33.6 ms |
+| first room, standing: plain walk | 30.1 | 60.2 | 14.1 ms |
+| first room, standing: index | 30.2 | 60.3 | 14.6 ms |
+
+The fight reaches the game's 30 steps a second and begins to draw in-between
+frames again (the CPU a step is no lower by as much as the walk saved,
+because those frames are drawn with it). The idle room has few entities and
+does not change. From the start of this series of rounds the same fight went
+from 24.8 and 25.9 steps a second to 29.4 to 29.9.
+
+**Correctness.** `test_cb.lua` (drive_stress.mjs, 28 checks): the fixed
+cases (order with priorities, each kind of parameter, 2.0 and 2, an entry
+added and removed through the game's functions and by hand, a function that
+removes itself, one that adds another, two parameters, an entry stored over
+another by hand, the audit), the counters that say the index was used, and a
+differential: 120 random lists whose functions remove themselves, remove
+others, add others and swap one for another while being walked, and 40 lists
+of 100 to 300 functions, each built twice, one fired through the layer and
+one walked by a reference written in the test from main.lua's loop, compared
+entry by entry (11,530 log entries, 1,375 firings through an index, 222
+walks that left theirs mid-walk). The same suite with the index off fails
+only the checks that say the index is used. 13 mutants through
+`mutate.mjs`, the command packing the mutated layer and running the suite in
+a browser (`.scratch/r115/mutants.sh`): 10 killed (a -1 or a missing
+parameter left out of an index, the place check, the walk's change check,
+the plain walk restarted from the top, -1 and two parameters sent through an
+index, the `__newindex`, the audit, the drop on a changed place); 3 survive
+and are each a second guard for what another already catches: the length
+comparison (the place check sees a shorter list), and the wrappers of
+`AddPriorityCallback` (the `__newindex` sees the new place) and
+`RemoveCallback` (the place check sees the shift). They are kept.
+
+**Not done.** The closure the walk allocates per firing, and the `pcall`
+around every function, are as before. A mod's own callback runners (Fiend
+Folio has one, `callbacks/dynamic.lua`) are the mod's.
+
+### 21.145 Round 116: installed mods follow the catalogue
+
+Page only (`mods.mjs`, `play.mjs`, `boot_web.mjs`). A mod installed from the
+catalogue was never refreshed: a release that pins a newer catalogue in which
+the mod changed left the player with the old files until they removed it and
+installed it again. That matters for the REPENTOGON-compatible layer
+(`repentogon`), which is game-side Lua the engine release expects to match,
+changes with nearly every release, keeps `<version>1</version>`, and is what
+Fiend Folio requires. Between release 22's catalogue and release 23's it is the
+only one of 206 entries that differs (133,259 -> 142,815 bytes of zip, 464,569 ->
+495,880 unpacked, 19 files both times, five Lua files changed).
+
+**What "different" is.** Never the version string; what the entry already
+carries (`entryIdentity`, `sameContent`):
+
+- a packed entry is its index's name, the start of the index's sha256, and the
+  index names every pack by its own sha256: exact;
+- an unpacked entry is its zip's size, the size it unpacks to, its file count
+  and its part count -- and its zip's sha256 when the entry has one. modpack.py
+  does not write `sha256` yet. The page records the sha256 of the zip it
+  installed, so once modpack.py writes `"sha256": sha256(blob)` the comparison
+  is exact with no refresh needed. Until then, a change that keeps all four
+  sizes the same goes unnoticed. That needs a one-character Lua edit that also
+  deflates to the same length.
+
+**What was installed is remembered.** An install from the catalogue writes
+`source: 'catalogue'` and `cat` (the identity, plus the sha256 of the zip it
+downloaded) into the mod's record; a packed one writes its index; an import from
+the device writes `source: 'device'`, and such a mod is never touched. A record
+from before this round:
+
+- packed: its `packed.index` is its identity, exact.
+- unpacked: nothing in the record can be checked against the catalogue's sizes
+  (the zip's size was not kept), so it is checked once by downloading it
+  (`verify`). Byte-identical files only get the identity written. Different
+  files are replaced only for the layer (`repentogon`, the updater's
+  `legacyFollow`), which the engine release expects to match. For any other
+  mod they mean a zip the player added themself under an id the catalogue
+  also lists (their own newer copy of a mod): between the catalogues that
+  existed before this round only the layer's entry ever changed
+  (`check_cat.py` at each release), so it cannot be an old catalogue install.
+  It is left as it is and remembered as `source: 'device'`, so it is not
+  looked at again.
+
+**One write, whole or nothing** (`replaceMod`). Everything is downloaded,
+unzipped and planned first. Then one transaction over the files and the record
+reads the record as it is at that moment, deletes the mod's files, writes the new
+ones and merges the record, keeping `enabled` and `added` (and the folder, which
+is the id). A mod removed in the meantime is not brought back, and one whose
+identity changed in the meantime (reinstalled) is left alone. A failure (host
+down, a part's 404, a store out of space) writes nothing; the old files stay
+whole and the next start tries again. The mod's save data is not in this store:
+`SaveModData` writes `c:/isaac/data/<id>/save<N>.dat`, which goes to the save
+store (`isaac-saves`). What the game writes under `mods/` is in `S_STORE`. Neither
+is in the transaction's scope.
+
+**When.** `play.mjs` starts the check as the page starts (`createModUpdater`), in
+parallel with the boot. With no catalogue mod installed it makes no request at
+all. The boot waits for it at `seed mods`, just before it reads the mods, for at
+most 2.5 s (`?modupdatewait=`). Small unpacked mods (a zip up to 4 MB: the layer,
+the layer first) are fetched and written before that point when they can be.
+Whatever is not finished then waits until the boot has read its mods
+(`afterSeed`, after `register packed mods`) and is written for the next start, so
+a running game never sees half of an update. A seeded mod is a copy in the
+engine's memory, so a later write cannot reach it anyway. A 403 while the game
+boots (jsDelivr's first answer for a file it has not served, cached for a minute)
+does not hold the boot: the part is asked for again a minute later, after the
+boot. A catalogue base pinned to a commit (`@<40 hex>`, what a release names) is
+fetched with `cache: 'default'`, so the browser's cache can answer it; any other
+base is revalidated. A browser that says it is offline is not asked. `?modupdate=0`
+turns it all off.
+
+**Packed mods** are refreshed only after the boot, always for the next start:
+their index is 600 KB and their changed eager packs can be megabytes. The new index
+and the eager packs the Cache API does not hold are fetched (a pack that is kept
+is reused: packs are named after their contents). Then the record moves to the
+new index with `packed.prev` set to the old one. The changed lazy packs come
+through round 108's background download at the next start, which plans from the
+record. The old index's packs stay through that visit, because the running game
+reads them by name. At the next start, before the game reads its mods, the packs
+that only the old index named are dropped (`stalePacks`: never one any installed
+packed mod's index names, its own new one included). Removing the mod also
+drops them.
+
+**What the player sees.** One `[mods]` line in the game log for each update,
+held until the boot's log exists:
+
+    [mods] REPENTOGON (browser): updated from the catalogue, 454 KB -> 484 KB (19 -> 19 files, zip 139 KB), 234 ms; in this start
+
+(or `from the next start`), `... could not be fetched (part 1 of 1 answered 404);
+the installed files stay, tried again at the next start`, `N installed mod(s)
+match the catalogue`, and the boot's `catalogue check:` line with how long it
+waited. The row in the mod browser and in the paper list notes `UPDATED` (in
+this start) or `NEW ON RELOAD` (next start), with the size change in the
+description. These use round 108's `rowNote` and `sizeNote`; a packed mod still
+downloading shows its percentage first.
+
+**Measured** (`.scratch/r116/drive_r116.mjs`, Chromium through Playwright, the
+dist of `.scratch/dist-n3` with these page files. The catalogue stand-in is
+served at 20 Mbit/s with 150 ms of latency per answer, which is what round 108
+used. One run each):
+
+| | wait at `seed mods` | requests to the catalogue host |
+|---|---|---|
+| nothing installed | 0 ms | 0 |
+| layer installed, the same, base not pinned (revalidated) | 0 ms (check done in 255 to 265 ms, before the boot got there) | 1 (the whole 240 KB) |
+| layer installed, the same, pinned base, persistent profile | 0 ms (check done in 7 ms) | 0: the HTTP cache answered |
+| layer to update (release 22 -> 23) | 0 to 105 ms over eight runs; the update itself took 228 to 248 ms | 2 |
+| catalogue host down (connection refused) | 1,603 to 1,624 ms (Windows retries a refused localhost connection for ~2 s) | 1 |
+| 150 kbit/s link | 2,501 to 2,505 ms (the cap); the update landed 7.8 s later, for the next start | 2 |
+
+The pinned case needs a browser with a disk cache. In an off-the-record
+Playwright context, the game's own downloads pushed the catalogue out of the
+in-memory HTTP cache, and it was fetched again (run1).
+
+With nothing to update and the check finished first, the boot does not wait.
+The check runs while the page fetches the engine, so a cold boot gives it
+seconds. A warm boot of this dist reaches `seed mods` within about a second of
+navigation. There, a catalogue that is slow to answer costs up to the cap: the
+whole 240 KB `catalogue.json` is fetched, and a revalidation without an ETag is
+the whole file again.
+
+Browser checks (all with a save file `c:/isaac/data/repentogon/save1.dat` and a
+state file under `mods/repentogon/` that must come through untouched):
+
+- release 22's layer (round 115's record) reloaded with release 23 pinned: the
+  store holds release 23's 19 files byte for byte, the record keeps `enabled`,
+  `added` and its folder, the save file is restored by the boot unchanged, the
+  engine prints `[REPENTOGON] browser layer, API 1.1.2`. The next start makes one
+  request and writes nothing.
+- the same with round 116's record and the mod turned off: updated, still off,
+  left out by the boot (`1 off`).
+- host down, then a part that 404s: the old files and record intact, the game
+  boots and the old layer runs. A later start with the host back: updated.
+- a 150 kbit/s link: the boot waits 2.5 s, runs the old layer, and the update is
+  written after the boot for the next start.
+
+40 of 40 browser checks (`.scratch/r116/run2/report.txt`). Unit tests:
+`tests/recomp-modupdate.test.js`, 10 tests (a stand-in IndexedDB whose transactions
+commit whole or not at all, a CDN, a Cache API). 25 mutants through `mutate.mjs`,
+all killed. The page's own suites stay at 130 of 130.
+
+Not done: a packed refresh in a browser (no two catalogues with different Fiend
+Folio indexes exist; covered by the unit test with hand-built packs). A new
+`requires` in an updated entry is not followed: a mod that newly needs another
+one does not get it installed. An entry that moved between zip and packed is
+reported, not converted. Not run against jsDelivr itself, on a phone, Firefox or
+Safari.
+
+### 21.146 Round 117: the whole collection at every door is spread over the passes after it
+
+Host only (`host_lua.c`, `host_gl_lazy.c`), `selftest.c`. Engine n8.
+
+**What was measured.** `.scratch/perf/perf-rooms.mjs` is new: a tiny mod walks
+the floor (a room transition every 60 updates, the door-walk animation, debug 3
+on, enemies left alone), the page records the time of every frame handed over
+and of the mod's log lines, and a browser trace of the walk carries the CPU
+samples (`disabled-by-default-v8.cpu_profiler`, exact times; the CDP profiler
+started beside the walk was tens of ms out of step and put a 90 ms frame at 24 ms
+busy). Per transition: the longest frame interval and the time lost to frames
+over 34 ms. On engine n3 (release 23), CPU x1:
+
+| | longest frame at a door, median | of it |
+|---|---|---|
+| plain game | 84 to 100 ms | 48 ms PNG decoding and upload, 5 ms `checkFramebufferStatus` |
+| Fiend Folio | 256 to 262 ms (max 393 to 454) | 112 ms `propagatemark`, `sweeplist`, `guest_free`; 38 ms PNG |
+
+The 112 ms is a whole collection. The game asks for one itself:
+`lua_gc(L, LUA_GCCOLLECT, 0)` at 0x007f769f, followed by `LUA_GCCOUNT` and
+`LUA_GCCOUNTB` for the line `Lua mem usage: %d KB and %d bytes` (the game's log
+has that line after `Room %d.%d(%s)` and `SpawnRNG seed: %u` at every room
+entry: 29 of them for 23 rooms and the start in a Fiend Folio tour), and at
+0x0086ee91 in the Lua engine's start. The import has three direct call sites and three register-held
+ones (`pequery.py xrefs-to 0x00b18310`: 0x008657d6 and 0x008658b0 are round
+113's count and step, 0x00872102 a count; 0x00691b8b counts for the console; the
+two above are the only `what == 2`). In the plain game the heap is 0.8 MB and
+the collection is under a millisecond. With Fiend Folio it marks and sweeps 90
+to 110 MB in the frame the room appears in. A real machine pays this too (it is
+the game's code); here it is two to three times dearer.
+
+**The change.** In `isaac_lua_gc`, a `LUA_GCCOLLECT` with more than 4096 KB of
+heap (`ISAAC_GC_FULL_NOW_KB`) is not made in the call. `ISAAC_LUA_GC_ROOM` says
+what is done instead:
+
+- `2`, the default: nothing. Round 113's pacing goes on as it was, and the
+  garbage of the room left goes in the cycle the heap's growth brings next.
+- `1`: a cycle is owed. From the next pass on the game's steps are made without
+  round 113's wait for growth, spread (a 128th of the heap a pass) and time-boxed
+  (2 ms a pass) as before, until a cycle has ended. A cycle already running when
+  the game asks is the one owed; one that had ended since the game's last step,
+  unseen, is counted as ended first and is not. Lua's pause leaves the debt at
+  minus a quarter of the heap after a cycle, so the owed steps first pay that
+  off: with Fiend Folio the cycle begins about half a second after the door.
+- `0`: the collection is made in the call, as the game asks.
+
+At or under 4096 KB the collection is always made as asked, so the plain game
+(a heap of 0.8 MB) is as it was; so it is with round 113's pacing off
+(`ISAAC_LUA_GC=0`).
+
+`1` was written first, as the nearer thing to what the game asks. On the walk
+(a door every two seconds) it and `2` give the same frames, and `1` keeps the
+main thread a tenth busier (0.79 against 0.71 and 0.75 of it), because a cycle
+is then always owed or running; in a fight that is time the game does not have.
+
+What changes for a mod under `1` and `2`: the garbage of the room just left is
+freed, and its finalizers run, seconds after the room appears and not before its
+first frame; `Lua mem usage` reports the heap as it is; the heap is larger
+between cycles (92 to 121 MB with Fiend Folio on the walk, where the collection
+at every door held it at 91 to 111).
+
+The second change is in the path every loaded sheet takes: a texture of 64 KB
+and up is kept coded until it is first used (round 97), and the coder measured
+the code and then wrote it, two passes over the pixels. It now writes into a
+buffer of half the RGBA (a longer code was never kept) in one pass, and stops
+when it would pass the end (`lazy_encode_to`). A code within four bytes of the
+half can now be refused where it was kept.
+
+**Measured** (`rooms_ab.sh`, Fiend Folio, CPU x1, 21 doors a run over seven
+rooms, the variants alternating; no trace running):
+
+| engine, runs | at the door | longest frame at a door | game updates a second |
+|---|---|---|---|
+| n5, 2 | the collection made (`ISAAC_LUA_GC_ROOM=0`) | median 270, 346 ms (the second run on a busy machine) | 23.3, 20.0 |
+| n5, 2 | a cycle owed (`1`) | median 156, 152 ms | 24.4, 25.1 |
+| n7, 2 | a cycle owed (`1`) | median 122, 81 ms (the first run on a busy machine) | 21.4, 25.1 |
+| n7, 2 | left to the collector (`2`) | median 93, 88 ms | 25.4, 25.8 |
+| n8, 2 | the collection made (`0`), rooms seen before | median 226, 198 ms; 14 of 14 over 100 ms | 23.0, 23.4 |
+| n8, 2 | left to the collector (`2`), rooms seen before | median 130, 136 ms; 12 of 14 over 100 ms | 25.0, 25.0 |
+
+The n7 and n8 rows have round 118's image keeping in them (n7) or switched off
+(n8, both rows), so they compare within an engine only. The machine also ran
+another agent's browsers during some runs; a run whose main thread was over 95%
+busy is marked. The plain game takes none of these paths (its heap is under the
+threshold) and its doors are round 118's.
+
+**Correctness.** selftest: the rule (`isaac_lua_gc_full_paced`: over the
+threshold, pacing on, switch on), a small heap collected in the call (a
+finalizer has run when it returns), a big heap not collected in the call and a
+cycle owed, the steps after it made with none deferred and to the cycle's end
+(the finalizer has run, nothing owed, the next step waits again), asked while a
+cycle runs, a cycle that had ended unseen, the switch off; the one-pass coder
+against the two-pass one byte for byte, a buffer one byte short, noise, a sheet
+that codes to between half and the whole. 9 mutants through `mutate.mjs` (the threshold, each of the three conditions, the cycle owed and not owed, the wait skipped, the unseen cycle, mode 2) and 4 of the coder (either bound dropped, never refused, the whole RGBA allowed), all killed by the selftest.
+
+**Not done.** Lua's own steps at an allocation are not time-boxed (only the
+game's are); the atomic phase of a cycle is one piece.
+
+### 21.147 Round 118: a loaded image is kept past its last user; a framebuffer shape GL called complete
+
+Host (`host_img_keep.c`, new; `host_gl_cache.c`, `host_gl_webgl.c`), one wrapper
+in `lift_patches.py`, `selftest.c`. Engine n7.
+
+**What was measured.** With round 117 in, the frame a room appears in was still
+84 to 100 ms in the plain game, 75 ms of it CPU, in a room that had been entered
+before as much as in a new one (the trace's own samples, `perf-rooms.mjs
+trace=1`):
+
+| in that frame, per door | ms |
+|---|---|
+| PNG: inflate (`sub_00ad3b30`, `isaac_fast_inflate_ring`), unfilter, premultiply, adler32 | 30 |
+| the kept-texture code of round 97 (`isaac_lazy_encode`, materialize) and the copies | 18 |
+| `checkFramebufferStatus` (a round trip to the GPU process) | 5 |
+
+The game counts the users of every image and frees an image, texture and all,
+when the last one lets go. Leaving a room lets go of what it used; the next room
+asks for most of it back, and the loader reads the archive, decodes the PNG and
+uploads it again.
+
+**Images.** The game's loader is 0x00a118d0 (`ret 0xc`: result, path, a third
+argument): a lookup of the path's name (0x00a17180), a lookup of the live images
+by that name (0x00a11780: found, it is returned), else an object by the file's
+extension (0x60 bytes, constructor 0x00a69950, the PNG vtable 0x00b9ff84), its
+load (`vtable+0x38`, 0x00a64a50 for a PNG) and registration. `Manager::LoadImage`
+(0x009588a0, the one exact ZHL signature here) is one of its two callers. The
+other creator of image objects, 0x00a11c70, makes procedural ones (the shadow
+ellipse, avatars) and is not touched. The smart pointer is `{image, counter}`;
+0x0040c550 copy-constructs one (it takes a count through the counter's
+`vtable+4`), 0x0040c440 is its destructor (`vtable+0xc`, then the deleter at
+[0x00c7163c] when it was the last).
+
+So nothing is cached. The loader is wrapped (the lifted body runs as it is), and
+after it the host takes one more counted reference of its own to the image it
+returned, into a guest slot the host owns, by calling the game's copy
+constructor; it lets go by calling the game's destructor. While the host holds
+an image the game's own lookup finds it, and the load is not made. The host
+lets go of the least recently asked-for images when what it holds passes 64 MB
+(`ISAAC_IMG_KEEP=<MB>`; an image's size is the RGBA bytes handed to
+`glTexImage2D` while it loaded, 256 KB when none were) or 256 images, and of any
+image nobody has asked for in 180 s (`ISAAC_IMG_KEEP_S`). `ISAAC_IMG_KEEP=0`
+takes none; `ISAAC_IMG_KEEP_LOG=1` names every image loaded or taken.
+
+What changes for the game: an image may outlive its last user. It is the object
+any other user alive at that time would have shared, in the state the game left
+it. The first budget tried, 32 MB, was full at 53 images and the walk's seven
+rooms did not fit (9 ms of PNG a door were left); at 64 MB a door into a room
+seen before has no frame over 34 ms in the plain game.
+
+**The framebuffer.** `host_gl_cache.c` already remembered the status GL gave for
+a framebuffer's attachment configuration (round 37), by object names. Every room
+builds its backdrop into new textures of the sizes the last room had, attaches
+them, and asks. Completeness depends on what is attached, not on which objects:
+per attachment point, a renderbuffer's format, size and samples or a texture
+level's format and size, and whether depth and stencil are one image. A shape GL
+called complete is now answered complete for other objects of that shape: only
+for level 0 of 2D textures whose image the cache saw (`glTexImage2D`), compared
+whole, at most 32 shapes, a COMPLETE answer only. `ISAAC_GL_FBO_SHAPE=0` asks GL.
+On the walk: 8 questions reach GL where one did at every door.
+
+**Measured** (engine n7, CPU x1, 21 doors a run over seven rooms, alternating):
+
+| | this round's switches | longest frame at a door into a room seen before | into a new room | slow doors (seen before) |
+|---|---|---|---|---|
+| plain | `ISAAC_IMG_KEEP=0`, `ISAAC_GL_FBO_SHAPE=0` | median 82, 80 ms | median 93, 91 ms (max 292, 318) | over 34 ms: 14 of 14, 14 of 14 |
+| plain | the defaults | median 29, 28 ms | median 47, 50 ms (max 225, 196) | over 34 ms: 1 of 14, 1 of 14 |
+| Fiend Folio | `ISAAC_IMG_KEEP=0`, `ISAAC_GL_FBO_SHAPE=0` | median 130, 136 ms | median 170, 170 ms | over 100 ms: 12 of 14, 12 of 14 |
+| Fiend Folio | the defaults | median 69, 69 ms | median 102, 123 ms (max 290, 283) | over 100 ms: 0 of 14, 0 of 14 |
+
+With Fiend Folio the game makes 25.6 and 25.5 updates a second over the walk
+where it made 25.0 (the walk's doors hold it under 30; it stood at 23.0 and 23.4
+before round 117). From the start of round 117, a door into a room seen before:
+plain 82 to 29 ms, Fiend Folio 226 and 198 to 69 ms.
+
+What is left in a Fiend Folio door (the trace, a run of its own): the mod's own
+Lua for the new room and the game's set-up of it; in the plain game 20 ms of CPU
+in the five doors of 21 that still had a frame over 34 ms.
+
+**Correctness.** selftest: the table (taken once, least recently asked-for let
+go and not the oldest taken, an exact fit, an image of the whole budget, one
+larger than it, unknown size, a reference that is not taken, 256 slots, a load
+made from inside a let-go, the idle time and an image asked for again at its
+edge) and the shape memo (another framebuffer and texture of the shape, a row
+taller, another level, another attachment point, a texture whose image was not
+seen, colour with a depth-stencil renderbuffer, another format and sample count,
+depth and stencil on one renderbuffer or two, an answer other than complete, the
+switch, a new image, a deleted texture, two names on one table entry).
+26 mutants through `mutate.mjs` (14 of the table, 12 of the shape memo), all killed; three of the memo's survived the first set of checks and are what the level-1, unknown-image and deleted-name cases were added for. The selftest is at 946 checks. In the browser: engine n8, both tours (`drive_stress.mjs phases=tour`, plain and Fiend Folio) with no stop and no Lua error; test_cb 28 0, test_hooks4 23 0, test_hooks3 42 0, test_hooks2 49 0, test_layer 49 0, test_layer2 95 0, test_layer3 53 0, test_layer4 49 0, test_gate 7 0, test_ach 24 0. A Fiend Folio walk of 29 doors stopped by `ISAAC_MAX_FRAMES` reports 120 images held (63.3 MB), 1,262 taken and 9,323 asked for again while held since the boot, 1,142 let go for room, none idle; 836 framebuffer questions answered from 7 shapes.
+
+**Not done.** The size of an image is what it uploaded, not what the GPU holds
+(a kept texture that was never drawn is only its code). On a phone the 64 MB is
+not measured. The loader's wrapper is skipped when the lifted body is re-entered
+mid-way (`g_reentry_eip`); such an image is simply not taken.
+
+### 21.148 Round 119: the parts of a giant function stay functions at the link
+
+One link flag (`build_boot.py`). Engine n7.
+
+**What was measured.** The worst frame of the plain game's walk was not a door:
+440 to 490 ms, once, in the first room with enemies. The browser trace names it:
+`wasm.CompileLazy` on the main thread, `funcIndex 2563`, `bodySize 1828241`,
+440 ms; the next largest, `bodySize 246833`, 77 ms. V8 compiles a wasm function
+whole, on the main thread, the first time it is called (the optimising compile
+comes later, off the thread: 5.6 s for that body). The name section says which
+function: `sub_005d4380__lifted`, the per-effect update, 1.83 MB of wasm, first
+called when the first effect entity of a session updates.
+
+Round 43 cut exactly that function into 13 parts (`split_giants.py`: ten
+functions over 60,000 lines of C, parts of 25,000), and noted "Binaryen's
+link-time inliner puts the `noinline` parts back into their trampoline (the wasm
+has one 1.77 MB `sub_005d4380` again)"; what it measured, V8's memory at the
+first run start, had gone anyway. The compile time of the first call had not.
+Binaryen inlines a function that has one caller whatever its size
+(`--one-caller-inline-max-function-size`, default unlimited), and every part has
+one caller, its trampoline.
+
+**The change.** `-sBINARYEN_EXTRA_PASSES=--one-caller-inline-max-function-size=4000`
+at the link (a global option of wasm-opt, so its place in the pass list does not
+matter; the size is Binaryen's own measure, expression nodes). Not passed to the
+`-O0` link of the node harness, which runs no wasm-opt.
+
+| `wasm_funcs.py` on the module | n6 | n7 |
+|---|---|---|
+| function bodies | 26,956 | 27,000 |
+| bodies of 1 MB and more | 2 (1,828,241 and 1,103,949 bytes) | 0 |
+| bodies of 250 KB and more | 12 (6.6 MB) | 3 (0.8 MB) |
+| the largest | `sub_005d4380__lifted` 1,828,241 | `sub_0068cdc0` 301,042 |
+| module | 54,675,640 bytes | 54,631,094 |
+
+**Measured** (`perf-rooms.mjs` on the plain game, CPU x1; the trace's
+`wasm.CompileBaseline` events of 4 ms and more during a 21-door walk):
+
+| | n6 | n7 |
+|---|---|---|
+| compiles of 4 ms and more | 6, 587 ms in all | 15, 243 ms in all |
+| the largest | 434 ms (1,828,241 bytes), 75 ms (246,833), 53 ms (345,584) | 82 ms (246,833), 28 ms (136,065), 19 ms (141,768) |
+| the worst frame of the walk, three runs each | 458, 491, 652 ms | 279, 312, 353 ms (n8: 225, 196) |
+
+The worst frame that is left is the first room with enemies: the archive reads
+for its sheets (the wasm waits on the reader, the thread idle), their decoding,
+and those compiles.
+
+A part is now compiled when it is first reached, and optimised on its own.
+
+**Not done.** The functions round 43 did not cut (under 60,000 lines) are whole:
+`sub_006c4b30__lifted` (246,833 bytes) is the 82 ms that is left, once, at the
+first enemy; nine more are between 180 and 301 KB. Cutting them is
+`SPLIT_MIN_LINES`, and needs round 43's frame-identical check run again. The
+shipped page is the portable one, which compiles the module from bytes
+(`play.mjs`, no `instantiateStreaming`), so V8's code cache holds nothing of it
+and every start compiles again.
+
+### 21.149 Round 120: Lua's small blocks kept by size -- measured, not kept
+
+A Fiend Folio fight on engine n8 spends 7.4% of its busy time in `guest_malloc`
+and `guest_free` (`perf-run-ff.mjs`, the CDP profile: Lua VM 49%, lifted game
+code 20%, host heap 7.5%, dispatch 5%). Lua tells its allocator the size of the
+block it frees, so engine n9 kept blocks of up to 256 bytes on lists by size
+(steps of 8 bytes, the link in the block's first word, 32 MB at most, a resize
+within one list returning the block) and asked the heap only when a list was
+empty; the selftest drove it (10 checks: the kind passed as a new block's old
+size, the list's full size asked of the heap, the cap, both directions of a
+resize across 256 bytes).
+
+Measured, the fight, CPU x1, 20 s, three alternating pairs: 33.92, 33.73 and
+34.08 ms of CPU a game update with every block sent to the heap, 34.08, 35.00
+and 34.14 ms with the lists. No difference, so it is not in the tree (the patch
+is `.scratch/r120/round120-not-kept.patch`). Do not re-open on the profile's
+share alone. Why the share did not turn into time was not measured (the lists'
+own counters were never read: the run meant to stop the engine and print them
+did not reach its frame count); one guess is that the time under those two
+names is the first touch of a block's memory, which a list pays as well.
+
+### 21.150 Round 121: luabridge's class check, natively when it passes
+
+Host (`host_lua.c` 1f), one wrapper in `lift_patches.py`, `selftest.c`. Engine
+n13.
+
+**What was measured.** A Fiend Folio fight (60 enemies, the player firing,
+`perf-run-ff.mjs`, CPU x1, the CDP profile on engine n8): 72% of the busy time
+is under `lua_pcallk` (the mod's callbacks), 22.5% under `call_guest_cfunction`
+(the game's functions as Lua calls them), and 10.1% under one lifted function,
+`sub_0085c590` (2.2% of it its own, the rest the Lua API calls it makes through
+the import shims). 0x0085c590 is luabridge's class check: every bound method
+and property starts by asking it whether the value at a stack index is an
+object of the class it was written for. 937 direct call sites; ECX = L, EDX =
+the index, [esp+4] the class's registry key, [esp+8] a byte "may be a const
+object"; EAX = the userdata's block; plain ret. Its body is some twenty calls
+of the Lua API: the class's table from the registry, the object's metatable,
+luabridge's mark on it (the boolean at 0x00c7f4b8), `__const` to tell a const
+table, the class's const table in its place for a const object, then
+`rawequal` up the `__parent` chain; on equality `touserdata`, or
+`luaL_argerror` ("cannot be const", or "<__type> expected, got <...>").
+
+**The change.** The wrapper asks the host first (`isaac_lua_getclass`). The
+host walks the way to "yes" with the same raw reads on its own side, puts the
+stack back as it came, and answers only when the answer is yes and nothing is
+raised: EAX, the return address, the one pop. Every other way -- not a
+userdata, no metatable, a metatable without the mark, another class, a const
+object where none may be, an index that is not a plain positive one, a key
+with no table behind it, a `__parent` that is not a table -- the stack is put
+back and the lifted function runs, so every error is the game's own text from
+the game's own code. ECX and EDX are left as they came where the lifted body
+leaves what its last call left; both are caller-saved, and no caller can read
+them after a function that ends in `lua_touserdata`. `ISAAC_LUA_NATIVE=0`
+keeps the lifted function for everything; `=2` runs it for the result and
+compares (a lifted function that raises where the native way said yes is
+counted at the next call).
+
+**What verify mode found.** The first build (engine n11), a Fiend Folio tour
+with `ISAAC_LUA_NATIVE=2`: 19,000,000 answers compared, none different, and
+31 lifted runs that did not return -- in the game's log, 30 of the mod's
+callbacks failing with `calling 'GetPlayerType' on bad self ((null) expected,
+got Entity)`, which a tour without verify mode never shows. The native answer
+was right and the lifted run was looking at a stack the native run had let
+something write over. Every import shim records the guest ESP of its caller
+(1b, round 100) so that a guest function Lua calls back -- a finalizer run by a
+collector step inside `lua_pushstring`, here -- gets its frame below it. The
+wrapper is guest code entering Lua without a shim, and made no record: the
+finalizer's frame went below the last shim's ESP, onto the frames between
+that and the class check's caller. In the plain native mode the caller would
+have gone on with its arguments overwritten about once in 600,000 checks.
+`isaac_lua_getclass` now records its caller's ESP as a shim does, for as long
+as its Lua calls last. With that (engine n13): 20,000,000 answers compared in
+the tour and 12,000,000 in the fight, none different, no run that did not
+return, no such line in the log. The count of runs that do not return is kept
+(a call is known by its ESP; nested ones are compared too).
+
+The class of the defect -- host code calling the Lua API for guest code with
+no record of the guest ESP -- was looked for elsewhere: the native `__index`
+and `__gc` (rounds 111, 114) are entered from Lua through a trampoline, under
+the record of the shim that entered Lua; `isaac_lua_gc` and
+`isaac_lua_setmetatable` are behind import shims; the layer's hooks use
+`isaac_lua_host_enter`; `host_img_keep.c` calls no Lua and places its own
+guest calls 0x1000 below the ESP it is given. This was the only one.
+
+**Measured.** The CDP profile of the fight on the engine with the native check: the
+function is gone from the sixty largest inclusive entries (it was 10.1%),
+`isaac_lua_getclass` is 0.45% of the busy time, and what is under
+`call_guest_cfunction` fell from 22.5% to 16.7%, under `luaT_callTM` from 21.6%
+to 16.0%.
+
+In time (`ab_engines.sh`, engines n8 and n13, the fight, CPU x1, 20 s, ten
+alternating pairs, four with n8 first and six with n13 first; the machine was
+in use, and single runs range from 34 to 52 ms of CPU a game update): n13 is
+ahead in eight of the ten pairs, the differences are -2.4, -0.3, 1.0, 1.1, 1.5,
+1.7, 1.8, 3.6, 5.2 and 12.7 ms, the median 1.6 ms of about 38 (4%), the mean 2.6
+with a standard error of 1.3. A gain of a few percent of a fight; the share the
+profile shows did not all turn into time, because the Lua calls the check makes
+are still made.
+
+**Correctness.** selftest (976 checks in all): an object of the class, of its
+const table, of a derived class and of one derived from that, with and without
+"may be const"; another class, the other way round, a metatable without the
+mark (also one that names the class as its `__parent`), a `__parent` that is
+not a table, a userdata with no metatable, a table with a class's metatable, a
+number, a key with nothing behind it, indexes 0, negative (with another
+object where the push would move it) and past the top; the entry (EAX, the
+return address, one pop; the flag's low byte with 0x100 and 0xFFFFFF01; the
+caller's ESP on record while the check runs and dropped after it; mode 0);
+verify mode's books (the same answer, another answer, a run that did not
+return, a check inside another's lifted run, an inner run unwound, returns
+nobody awaited, 32 nested and a 33rd). 22 mutants through `mutate.mjs`, all
+killed; one more, the walk reading a `__parent` that is not a table, survives
+because Lua's answer for such a read happens to be harmless: the test is kept
+as a guard against undefined behaviour. In the browser on n13: the plain and the Fiend Folio tours with no stop, no Lua error and none of
+the layer's `failed:` lines; test_cb 28 0, test_hooks4 23 0, test_hooks3 42 0,
+test_hooks2 49 0, test_layer 49 0, test_layer2 95 0, test_layer3 53 0,
+test_layer4 49 0, test_gate 7 0, test_ach 24 0.
+
+**Not done.** 0x0085c3e0 (the exact-class check the finalizers use, replicated
+in round 114 for them alone) and `__newindex` 0x0085cf30 are lifted. The
+`index > top` test in the native check is a second guard (Lua answers "no
+value" for such an index itself).
+
+### 21.151 Round 122: the layer decides by itself which mods see REPENTOGON
+
+Page (`web/mods.mjs`, `web/boot_web.mjs`) and layer (`rgon/rgon.lua`,
+`rgon/gate_names.lua`). No engine change: engine n13.
+
+**What it was.** `REPENTOGON` was a global only for the mods on a list written
+by hand in `rgon.lua` (round 102): five mods, each read and run. Every other
+mod read nil. A mod that needs REPENTOGON, or that the layer covers, did
+nothing with the layer installed until somebody added its folder to the list
+and a new layer was released.
+
+**What it is.** As the page seeds the installed mods it reads each one's Lua
+(`createModScan`: comments and string contents blanked first) and writes
+`mods/repentogon/modscan.lua`, one row per mod that names `REPENTOGON` in code:
+`says`, `quits` (top-level tests of `not REPENTOGON`, `REPENTOGON == nil`, the
+else branch of `if REPENTOGON then`, or `assert(REPENTOGON`, in `main.lua`
+only, that end the file or raise), `yields` (`if REPENTOGON then return
+[true|false|nil] end`, at any depth) and `names` (what is called after `.` or
+`:`, every `MC_` name, every capitalised name used as a table, less the
+functions the mod defines itself). The layer loads that file and
+`gate_names.lua` (1,132 function names and 35 global tables that only
+REPENTOGON has: every `{ "Name", Lua_... }` row of its sources, less every
+identifier found in the executable or in the game's own scripts; generated by
+`tools/gate_names.py`, and a test runs its `--check`), weighs the names against
+`R.Implemented`, and decides, in this order: the mod's `main.lua` quits
+without REPENTOGON, shown (a missing global table becomes a stand-in; each
+missing name is logged); it steps aside for REPENTOGON, hidden; it uses
+nothing of REPENTOGON's, hidden; the layer has every name it uses, shown;
+otherwise hidden. The hand list wins over the rule. `ISAAC_RGON_AUTO=0`
+keeps to the list; `?modscan=0` writes no scan; an older page with the new
+layer, or the new page with an older layer, behaves as before (the layer says
+`gate: no scan of the installed mods`; the older layer never opens the file).
+
+**Why this order.** Two rules were tried on the catalogue first and dropped.
+"Shown when the layer has every name it uses" alone showed Mantle Rework, whose
+one REPENTOGON name is a function of its own (so a mod's own definitions are
+taken out of its names) and which exists to step aside under REPENTOGON (so
+the `yields` test comes before coverage). Counting a quitting test in any file
+marked External Item Descriptions and Auri as mods that cannot run without
+REPENTOGON, when the file that quits is a part of them that is for REPENTOGON
+only (so `quits` is `main.lua` alone).
+
+**Measured.** Over the 203 mods of the catalogue (`tools/gate_preview.mjs`, the
+rule written a second time in JavaScript): 23 name REPENTOGON in code; 6 are
+shown (aarons-door-overhaul, enhanced-boss-bars, fireworks-for-good-items, on
+the hand list already, and completionmarksrep, da-rules, falling-isaac-rebirth,
+new), 17 hidden (4 step aside, 4 use nothing, 9 use a name the layer lacks and
+run without it; reactionapi is among the 9 for `BossType`, a table of its own
+with one of REPENTOGON's names, and stays shown through the hand list). No
+catalogue mod's `main.lua` quits without REPENTOGON; Fiend Folio's does, and it
+is a packed mod the page does not scan, on the hand list. In the browser on
+n13, `tools/test_gate_auto.mjs` (eight test mods and the packed layer installed
+through the page's file input; three starts: the rule, `?modscan=0`,
+`ISAAC_RGON_AUTO=0`): 108 checks, 0 failed. A tour with the six shown catalogue
+mods: no stop, no Lua error, no mod error, with the rule and with the list
+alone (da-rules and falling-isaac-rebirth did not reach their REPENTOGON code
+in it). The layer's older suites with the new layer: test_hooks4 23 0,
+test_hooks3 42 0, test_hooks2 49 0, test_layer 49 0, test_layer2 95 0,
+test_layer3 53 0, test_layer4 49 0, test_gate 7 0. test_gate first failed 2 of
+its 7: its mod (the stress driver's, which names `REPENTOGON` in the checks it
+makes and one of REPENTOGON's callbacks the layer has) was shown by the rule,
+as the rule says; the suite is about a mod that is not shown, so it now uses
+`ImGui` in a branch for REPENTOGON, and the layer's line for it reads "not
+shown ... 1 missing: ImGui".
+
+**Mutants** (through `mutate.mjs`). The scanner, against
+`tests/recomp-modscan.test.js`: 15, of which 13 were killed at once and 2
+survived (the layer's own folder weighed like a mod; `REPENTOGON` left among a
+mod's names) until the tests named what they missed; all 15 killed since. The
+layer's rule, each against a full run of `tools/test_gate_auto.mjs` with the
+mutant layer packed: 10 (each of the five lines of the rule, the hand list
+overruled, no stand-in, `ISAAC_RGON_AUTO=0` ignored, a missing function not
+counted, a missing callback not counted), all killed.
+
+**Not measured, and what the rule cannot see.** No mod outside that catalogue
+was run. A method is matched by its name without its class. A mod that uses
+names the layer has and depends on behaviour the layer does not reproduce is
+shown. A mod shown because it cannot run otherwise runs with stand-ins where
+the layer has gaps: it loads, and the features behind the gaps do nothing.
+
+### 21.152 Round 123: a mod the catalogue marks experimental
+
+Page (`web/mod_browser.mjs`, `web/mods.mjs`) and the catalogue builder
+(`assets/modpack.py`). No engine change.
+
+Fiend Folio runs on the REPENTOGON-compatible layer, which lacks part of what
+it uses (21.151: it is shown `REPENTOGON` with stand-ins), and it is the
+heaviest mod of the catalogue. A player could not tell that from the browser.
+Now a catalogue entry may carry `"experimental": true`
+(`modpack.py --experimental <catalogue id or Workshop id>`, repeatable; an
+unknown id is an error; an entry carried over by `--keep` keeps its mark), and
+the browser says so: `EXPERIMENTAL` at the right of the mod's row in the list
+(where no progress or update note is shown), and on the mod's page, above the
+description and the INSTALL button, the word in a frame followed by `MAY BE
+BUGGY AND LAGGY`. Typing three or more letters of the word finds the marked
+mods, ahead of a description that merely has the letters. The paper a build
+without the browser's art shows puts the same words first in the line under
+its list.
+
+The mark is not part of what the updater compares (`entryIdentity`: a packed
+mod's index name, or the sizes of a zipped one), so marking an entry updates
+nobody's installed copy.
+
+Checked: `tests/recomp-mod-browser.test.js` and `tests/recomp-modpack.test.js`
+(eight mutants through `mutate.mjs`, all killed), and by eye on a dist with
+the browser's art and a copy of the catalogue with the mark, at 960x540 and
+at 390x844 with touch. In the list the long name is cut to make room for the
+word ("Damn, Fiend... EXPERIMENTAL"); the mod's page has the whole name.
+
+### 21.153 Round 124: the debug console as a switch, and a new save that stays writable
+
+Page (`web/play.mjs`, `web/boot_web.mjs`, `web/menu_overlay.mjs`,
+`web/play.html`), one block patch (`lift/lift_patches.py`, 0x00959618), a
+driver (`web/drive_console.mjs`).
+
+**Where it came from.** A pull request (19) turned the game's debug console on
+for every player by rewriting `EnableDebugConsole=1` into the stored
+`options.ini` at every start, and moved the console key from the backquote to
+F2. Its aim, a console a player can reach without editing a file they cannot
+reach, is kept. Its means are not, for what the binary says the option does.
+
+**What the option does besides opening the console.** 0x009595e0 is the game's
+"achievement unlocks are disallowed" (REPENTOGON's
+`Manager::AchievementUnlocksDisallowed`; `ret 4`, its argument never read; 17
+direct callers and no other call form: `xrefs-to` = 17, the bytes `e0 95 95 00`
+occur nowhere in the file; decode config linear+skipdata+jtab-mask v2). Offline
+it is
+
+    if (!anyModEnabled(Manager+0x2a6c0) && !Options.EnableDebugConsole) return 0;
+    return !Unlocked(4);
+
+so an enabled console counts exactly as an enabled mod, until achievement 4 is
+on the save. Five run starts (Game::Start 0x006f5320 and the daily, rerun,
+debug and continue starts) store that answer, or-ed with the seed and debug
+terms, into the save's read-only flag (PGD+1 = Manager+0x15) **inline**
+(0x006f5544, 0x006f5c9c, 0x006f747d, 0x006f783b, 0x006f86e2), not through
+`SetReadOnly` (0x009299e0). TryUnlock, IncreaseEventCounter, AddChallenge and
+AddBestiaryKill each return at once on that flag. Achievement 4 is itself
+behind TryUnlock, so a save in that state cannot leave it.
+
+**That corrects round 81** (above, "Achievements with mods on": "one function
+writes that byte"). The block patch at 0x009299e4 covers `SetReadOnly` alone;
+the log line it watched has 26 references, 25 of them beside inline stores.
+Measured on engine n13 with a fresh profile and a run started by keys
+(`.scratch/r124/ro_probe.mjs`): the flag is 0 in a plain run, **1 with one
+empty mod enabled** and 1 with the console enabled, the game logging `Setting
+PersistentGameData ReadOnly to True` both times. A player who installed a mod
+before ever beating Mom has earned nothing since round 81 said they would.
+
+**The patch.** In 0x009595e0, after the call that asks whether a mod is
+enabled, the offline path takes the exit that answers no (0x00959652), the one
+it takes when neither a mod nor the console is enabled. The netplay branch
+(0x0095965b) is untouched; a seeded run and a debug start still set the flag
+through the other terms of the callers' test; the HUD's "no achievements" icon
+(0x009a3eb0, the same answer) follows.
+
+**The switch.** The game's OPTIONS screen (10) has no entry for the console,
+so the page hangs a hint paper beside it, as on the MODS screen: C, or a
+click, flips `Options.EnableDebugConsole` in the game's memory (Manager+0x2a398:
+the byte the game's own Lua property `Options.DebugConsoleEnabled` reads at
+0x00897360 and writes at 0x00897370), which Console::Update tests every frame,
+and rewrites that one line of the stored `options.ini` (`setIniOption`), so
+the choice survives a reload whether or not the game saved its options. Off by
+default, as the game ships it: nobody's options are changed unasked, a stray
+press of the key beside Esc and Tab does nothing, and an open console (which
+redraws its backlog every frame, 34% of the samples in round 90b's profile)
+is something a player chose. Not offered on a touch-only device, which has no
+keys to type with.
+
+**The key stays the backquote** (GLFW 0x60 by scancode 0x29, the position left
+of 1 on every layout): the game reads that key and no other, and F2 is a key
+mods bind. While the console is open the page's own keys stand aside: F and N
+are letters of a command then (`goto s.default.1` asked for fullscreen).
+
+**The save import (issue 17)** was in the same files: EDIT FILE's IMPORT FILE
+takes a bare `persistentgamedata.dat`, but the picker's `accept` list named
+`.zip` and `.json` only, and an iPhone greys out what an accept list does not
+name. The list is gone, and since any file can now be chosen, a bare file is
+told by its first bytes (`ISAACNGSAVE0...`, `ISAACNG_GSR...`: `saveFileKind`)
+and refused when it is not a save, instead of being written over one by name.
+
+**Measured.** Engine n14 (this patch and 21.154's fixes), a fresh profile, a
+run started by keys: the read-only flag is 0 in a plain run, with the console
+switched on and with one mod enabled, the game logging `ReadOnly to False`
+each time (n13: 0, 1, 1). `drive_console.mjs` (27 checks: off by default and
+the key opens nothing; the paper on the OPTIONS screen, C on, C off, a click
+on, the stored `options.ini` following each time; in a run the key opens the
+console, `goto fnfn` typed into it is its line with no fullscreen request and
+no FPS flip, a held Backspace erases more than one character, Enter on the
+empty line closes it; F and N are the page's again; the switch survives a
+reload): 27 of 27 on n13's page and on n14. `tests/recomp-console-switch.test.js`
+(8 tests); 11 mutants of the page helpers through `mutate.mjs`, 10 killed and
+one equivalent (a length test before a compare that already fails past a short
+file's end; the test was removed).
+
+**Not measured.** An iPhone's picker (issue 17): the cause is read from the
+markup and the fix is the absence of the list. What the game does to a run in
+which console commands were used is the game's own and was not changed or
+censused beyond the terms named above.
+
+### 21.154 Round 124b: the ending videos (issue 18)
+
+Host (`host_gl_cache.c`, `host_gl_webgl.c`, `selftest.c`), the lift runtime
+(`lift/recomp_rt.c`) and one new lift pass (`lift_patches.py` `apply_mmx64`).
+Engine n14.
+
+**The report.** An ending plays its sound over a black screen. It reproduces
+on n13 with `?ISAAC_CUTSCENE=400:3` (the Epilogue) and `400:4` (the Womb
+ending): the anm2 part shows, the Theora part is black (screenshot mean 0.0),
+the credits show; the same under hardware ANGLE and SwiftShader. Round 14's
+"the Epilogue plays through" was a node run that counted decoded frames and
+never looked at one.
+
+**Two causes, one behind the other.**
+
+1. *The frames never reached the texture.* theoraplayer creates its frame
+   texture as RGBA (`texImage2D(RGBA, 1024x1024, RGBA, UNSIGNED_BYTE)`) and
+   writes every frame with `texSubImage2D(960x544, GL_RGB, UNSIGNED_BYTE)`.
+   Desktop GL converts; WebGL2 answers `INVALID_OPERATION` and uploads nothing
+   (Chrome says so itself, 73 to 101 times a run; `ISAAC_GL_CHECK=1` shows
+   error 0x502 on every video frame and no GL error before the video). The
+   host now keeps each texture's level-0 internal format by name
+   (`isaac_glc_tex_ifmt`) and widens GL_RGB rows bound for an RGBA texture to
+   RGBA with alpha 255, in bands of at most 4 MB (`ISAAC_GL_RGB_WIDEN=0` for
+   an A/B: black again). `glEnable/glDisable(GL_TEXTURE_2D)`, which WebGL2
+   rejected with 0x500, are no longer forwarded.
+2. *The frames were wrong.* With the upload fixed the picture was green
+   vertical stripes: in every 8 pixels 2 right, 2 black, 2 (0,Y,0), 2
+   (0,135,0), which as YUV is the upper 16 bits of every 32-bit group of each
+   plane being zero. The lifter's by-value CALLOTHER path passes an MMX
+   operand as `(uint32_t)`, so lanes 2 and 3 of `paddsw`, `pmulhw`, `psraw`,
+   `psllw`, `paddusb`, `psubusb` and `packsswb` were lost. All 200 such sites
+   are in one translation unit and all in libtheora's MMX kernels (fragment
+   reconstruction 0x00ae4630 / 0x00ae46e0 / 0x00ae4750, the iDCTs 0x00ae4830 /
+   0x00ae4bf0, the loop filter 0x00ae53b0); the note in `recomp_rt.c` that put
+   them in the CRT was wrong. `apply_mmx64` rewrites each site to a 64-bit
+   helper with `(uint64_t)` operands at every build (idempotent; an
+   unrecognised site shape stops the build), and `recomp_rt.c` has real 4- and
+   8-lane bodies for the seven. libyuv's SSSE3 row converter (0x00acdcb0) was
+   ruled out first: lifted against Unicorn on 50 random rows, 0 mismatches.
+
+**Measured.** Whole functions, lifted against Unicorn (`.scratch/issue18/
+funcdiff.py`): before, every reconstruction and iDCT kernel differs in 5 of 5
+runs with exactly that pattern; after, 0 of 5. Each of the seven ops alone, 11
+forms, 40 vectors each: all pass. In the browser on n14: the Womb ending and
+the Epilogue show their pictures, 0 GL errors and 0 ANGLE warnings, both log
+"finished playing" and the credits follow; under SwiftShader the Womb ending
+is lit. Selftest 983 checks (7 new, 4 mutants killed); `tests/recomp-mmx64.test.js`
+(3 tests: the pass's text, idempotence and refusal; apply and check on a lift
+directory; the helpers compiled natively against vectors worked out from the
+instruction reference; 4 mutants killed).
+
+**Not measured.** The reporter's GPU (neither cause depends on one); endings
+other than 3 and 4; the cost of widening about half a megapixel a frame. The
+root fix belongs in `lift.py` (a CALLOTHER with 8-byte operands through the
+wide path), after which the pass finds nothing to do.
+
+### 21.155 Round 125: the console is a row of the OPTIONS list
+
+Page only (`web/play.mjs`, `web/boot_web.mjs`, `web/menu_overlay.mjs`,
+`web/drive_console.mjs`). No engine change: engine n14.
+
+**What was asked.** Round 124's switch was a hint paper beside the OPTIONS
+screen and the C key. The owner's word on it, the hour it went live: it should
+not be a paper of its own, it should be something one enables in the settings
+list.
+
+**How the list is made** (0x009b23a0 Update, 0x009b31c0 Render, 0x009b4810
+the builder; decode config linear+skipdata+jtab-mask v2). The main menu's
+options object is MenuManager+0xcecc (screen 10; a second one at +0xeb50 for
+screen 20 and a third in the pause screen share the code, told apart by the
+mode dword at +0). It holds a `std::vector<int>` of row ids at +0x27c, built
+per mode, and its selected row at +0x8 (measured: 23 rows on the main menu,
+Down from the last wraps to the first). Render walks the vector, and for each
+id plays the animation of that row's name in the options sprite
+(`OptionsMenu.anm2`: "SFX", "Fullscreen", ... one animation a row, with a name
+layer, an ON/OFF or bars layer and a cursor layer) at a pitch it derives from
+the row count, the paper growing with it; Update's switch on the id changes
+that row's option. So a row's words are art, not text, and a row is whatever
+its animation draws.
+
+**Two finds.** The game's own sheet has the word: `OptionsExtra.png` carries
+a hand-lettered CONSOLE at (0,160), 96 by 32, which no animation draws. And
+the list has a row that means nothing here: STREAMER MODE (id 22, pushed for
+every mode but the pause menu's), which toggles Options.StreamerMode
+(Manager+0x2a3e0; 4 references in `.text`: the menu's read, write and draw,
+and 0x0090f700, which masks a player's name for the ten callers that draw
+names in online play).
+
+**What the page does.** Nothing is drawn by the page. (1) It rewrites two
+frames of the loaded "StreamerMode" animation in the game's memory: the name
+layer's first frame from crop (128,64) 112x16 at (-54,19) to crop (0,160)
+96x32 at (-38,12), and the cursor's from x -69, y 18 to x -57, y 17, beside
+the shorter word. The game then draws CONSOLE ON / OFF itself, in its own
+lettering, with its own cursor, scroll, sounds and filter. The frames are
+found by walking the sprite (animation table at sprite+0x74, 0x13c a record,
+name first; layers at +0x18; a frame's first ten floats), and written through
+the one write the page has, `isaacGuest.swapFloats`, which replaces a run of
+floats only where every one holds the value expected: a sprite that is not
+the one read here is left alone and the row stays STREAMER MODE. The table's
+address is remembered, so a menu built again after a run is relabelled again.
+(2) It keeps Options.EnableDebugConsole equal to the row's byte
+(`consoleRowStep`, five looks a second): at first sight the row takes the
+console's value; a change of the row is the player's, the console follows and
+the options.ini line is stored; a change of the console's byte from elsewhere
+(a mod's `Options.DebugConsoleEnabled`) shows on the row. The hint paper and
+the C key are gone. A touch-only device, which cannot type into a console, is
+left with the list as the game has it.
+
+**Measured.** The layout was read from the running game before anything was
+written: the "StreamerMode" animation's layer 13 frame is
+[128,64,112,16,-54,19,1,1,16,16] and its layer 5 frame
+[235,24,18,22,-69,18,1,1,16,16] in memory, the anm2's own values; Right on row
+17 flips Manager+0x2a3e0 and nothing else in the options block.
+`drive_console.mjs` on n14 (a fresh profile): 33 of 33 -- the row is the
+console's and the list still has 23 rows; Down reaches it; Right on, Right
+off, Enter on, the stored options.ini following each time; the console's byte
+set from elsewhere shows on the row; in a run the key opens nothing while off
+and the console while on; the round-124 checks of typing, F and N; a change
+in a run is stored; after a reload the console is on and the row says so.
+`tests/recomp-console-switch.test.js` (11 tests); 13 mutants of the row's
+logic and of the write through `mutate.mjs`, all killed.
+
+**Not measured, and what is given up.** The pause menu's options have no
+such row (the game does not list STREAMER MODE there): the console is
+switched from the main menu. Streamer Mode itself is no longer switchable
+here; its one consumer is online. A row left ON by a player before this round
+is set to the console's value at first sight, not the other way round.
+
+### 21.156 Round 126: the offline build as an .svg
+
+`assets/portable.py svg`, and two page changes (`web/play.mjs`,
+`web/boot_web.mjs`). No engine change.
+
+**Why it is not the .html renamed.** A browser opens an `.svg` as an SVG
+document: parsed as XML, `<script>` run, but the DOM is not an HTML document's
+-- `document.createElement` makes null-namespace elements (a `canvas` that is
+no canvas), there is no `document.body`, `innerHTML` parses as XML. The page
+uses all three. So the `.svg` carries the payload in its own scripts and one
+XHTML `<iframe>` in a full-size `<foreignObject>`, and its last script hands
+the iframe the page as `srcdoc`. An srcdoc document is a real HTML document with
+its parent's origin: the page runs unchanged, its first script takes the
+parent's payload object (`parent.__isaacPortableData`, shared, not copied),
+and its IndexedDB and localStorage are the `.svg`'s.
+
+**The XML rules the writer keeps.** No "]]>" inside a CDATA section (split
+into two where a module holds one); no raw control characters (`json.dumps`
+escapes them); every script under libxml2's 10,000,000-byte text-node limit,
+so the payload goes in 4 MiB pieces, one script each (271 for the full game).
+
+**The page changes.** An srcdoc's location is `about:srcdoc`, which no relative
+URL resolves against: `new URL('.', location.href)` throws, and it is the
+page's first statement. The page's folder and its two other relative URLs
+are now resolved against `document.baseURI` -- the page's own URL on a served
+page, so nothing changes there, and the `.svg`'s in the iframe. "Reload
+without mods" reloads an srcdoc instead of rewriting its query. The srcdoc page
+has no query string: `?touch=1` and the like do nothing in the `.svg` build.
+
+**Measured** (release 27's dist, Chromium headless, the network switched off):
+the `.svg` is 1.45 GB like the `.html`; parsed in 25 s, the game drew its 300th
+frame at 34 s, a run started with keys sent to the top document (the iframe
+takes the keyboard on load and on a click), no stop, no page error, no network
+request, its saves in IndexedDB; in a persistent profile the saves and a
+localStorage key were there after the browser was closed and opened again.
+The `.html` rebuilt with the page change: the same. `tests/recomp-portable.test.js`
+(3 new tests: the XML parses, one iframe with its allowances, the payload byte
+for byte from the parsed scripts, the sizes the page is told, a module holding
+"]]>" and control characters intact, every script under the limit; the
+refusal of an over-long script; the page's URL bases); 9 mutants, all killed.
+
+**Not measured.** Firefox and Safari (Firefox parses XML with expat, whose
+limits differ); a phone. An `.svg` used as an image (`<img>`, a CSS
+background, an upload preview) runs no script and shows only its loading line.
+
+**The light `.svg` (`portable.py svg-wrap`).** The same wrapper around a
+chunked page instead of an offline one: the `.svg` holds only the page (about
+half a megabyte) and the page fetches its chunks from jsDelivr as the GitHub
+Pages page does. The wrapper refuses a page it cannot run: one whose payload
+is at a relative URL (an srcdoc has no folder of its own), an offline page,
+and one whose `play.mjs` or `boot_web.mjs` predates this round (no
+`document.baseURI`; release 27's pages are such, so the first light `.svg`
+was made from release 27's GitHub Pages page with those two modules swapped
+for this round's, everything else checked equal, `.scratch/offline27/light_page.py`;
+from the next release on, the GitHub Pages page itself can be wrapped).
+Measured (Chromium headless, network on): opened from disk and served by a
+plain web server as `image/svg+xml`, the 535 KB `.svg` drew its 300th frame
+at 22-24 s, started a run with keys, read the mod catalogue (206 mods), kept
+its saves in IndexedDB; every request but the `.svg` itself went to
+cdn.jsdelivr.net, none failed. `tests/recomp-portable.test.js`: 1 more test
+(the page round-trips byte for byte through the XML, the four refusals); 4
+mutants, all killed.

@@ -161,7 +161,7 @@ export function createEditFileMenu(opts) {
   // readAsset (round 70) is how a build with no server hands over its own files
   const { stage, canvas, assetsUrl, readAsset, actions, injectKey } = opts;
   const log = opts.log || (() => {});
-  const state = { open: false, slot: 0, cursor: 0, message: null, fps: null, fpsOn: false, closing: false, creditOn: false, confirm: false };
+  const state = { open: false, slot: 0, cursor: 0, message: null, fps: null, speed: null, fpsOn: false, closing: false, creditOn: false, confirm: false };
   const M = menuAssets(opts);
   const { A, load, play, measure, drawText } = M;
   // Off on every load. N flips it for this visit only: it used to be remembered,
@@ -249,8 +249,9 @@ export function createEditFileMenu(opts) {
     gg.imageSmoothingEnabled = false;
     gg.clearRect(0, 0, fpsEl.width, fpsEl.height);
     if (state.fps == null) return;
-    // just the number, white, in the game's font, a dark shadow a pixel down-right for the light rooms
-    const text = `${Math.round(state.fps)}`;
+    // the number (and the game's speed when it runs slow), white, in the game's font, a dark shadow a
+    // pixel down-right for the light rooms
+    const text = readoutText(state.fps, state.speed);
     drawText(gg, text, 3, 3, A.atlas);
     drawText(gg, text, 2, 2, A.atlasWhite);
   };
@@ -412,7 +413,7 @@ export function createEditFileMenu(opts) {
     current: () => rows()[state.cursor] || null,
     confirming: () => state.confirm,
     hit, tapRow, back,
-    setFps: (fps) => { state.fps = fps; if (state.fpsOn) { if (!M.isReady()) load().then(() => { fpsEl.hidden = false; drawFps(); }).catch(() => {}); else { fpsEl.hidden = false; drawFps(); } } },
+    setFps: (fps, speed = null) => { state.fps = fps; state.speed = speed; if (state.fpsOn) { if (!M.isReady()) load().then(() => { fpsEl.hidden = false; drawFps(); }).catch(() => {}); else { fpsEl.hidden = false; drawFps(); } } },
     // the screen the engine is on, so the credit knows whether to be there
     setScreen,
     creditShown: () => state.creditOn,
@@ -644,4 +645,135 @@ export function createPaperMenu(opts) {
     element: () => overlay,
     preload: load,
   };
+}
+
+// ---- what the FPS readout says ------------------------------------------------
+//
+// The number alone was the frames the game handed to the browser in the last
+// second. That stays high while the game itself falls behind: the game steps
+// its logic 30 times a second and draws twice per step, so a step that takes
+// 40 ms still gives 50 "fps" while everything on screen moves at 83% of its
+// speed. The readout therefore also says how fast the game is running, when
+// it is not running at full speed: "50 83%".
+//
+// ticks: the game's logic counter (Game+0x264f8), 30 a second at full speed.
+// It stands still in menus and while paused, and for part of a second across
+// a room change, so a low second counts only once the one before it was low
+// too, and a second without a single step says nothing.
+
+export const TICKS_PER_SECOND = 30;
+export const SLOW_BELOW = 0.95;
+
+// One sample per second. `state` is the caller's own object, kept between calls
+// ({} to begin with); returns { fps, speed } with speed null when there is
+// nothing to say (not in a run, paused, or running at full speed).
+export function sampleReadout(state, { frames, ticks, ms }) {
+  const dt = ms - (state.ms ?? ms);
+  const out = { fps: null, speed: null };
+  if (state.ms != null && dt > 0) {
+    out.fps = (frames - state.frames) * 1000 / dt;
+    // (a counter that went back, a new run's, gives a negative count: nothing is said)
+    const stepped = ticks != null && state.ticks != null ? ticks - state.ticks : 0;
+    const speed = stepped > 0 ? Math.min(1, stepped * 1000 / dt / TICKS_PER_SECOND) : null;
+    const low = speed != null && speed < SLOW_BELOW;
+    if (low && state.low) out.speed = speed;
+    state.low = low;
+  }
+  state.ms = ms; state.frames = frames; state.ticks = ticks;
+  return out;
+}
+
+// "58", or "50 83%" when the game is running slow
+export function readoutText(fps, speed) {
+  if (fps == null) return '';
+  const n = `${Math.round(fps)}`;
+  return speed == null ? n : `${n} ${Math.round(speed * 100)}%`;
+}
+
+// ---- the OPTIONS list's console row: its two decisions, apart from the game (round 125) ----
+//
+// The row's value (the game's StreamerMode byte, which the row toggles) and the console's
+// switch (EnableDebugConsole) are kept equal by play.mjs, which looks at both five times a
+// second and asks here what to do. `st` is what was seen last: { seen, console, row }.
+//   first sight            the row takes the console's value (options.ini is trusted for the
+//                          console's), nothing is stored
+//   the row changed        the player turned it: the console follows, and the choice is stored
+//   the console changed    something else set it (a mod's Options.DebugConsoleEnabled): the
+//                          row follows, nothing is stored
+// Both changed at once: the row wins (it is the one a player's hand is on).
+// Returns { write: null | { name: 'streamer' | 'console', value }, store: null | boolean }.
+export function consoleRowStep(st, con, row) {
+  if (typeof con !== 'boolean' || typeof row !== 'boolean') return { write: null, store: null };
+  if (!st.seen) {
+    st.seen = true; st.console = con; st.row = con;
+    return { write: row !== con ? { name: 'streamer', value: con } : null, store: null };
+  }
+  if (row !== st.row) {
+    st.row = row; st.console = row;
+    return { write: con !== row ? { name: 'console', value: row } : null, store: row };
+  }
+  if (con !== st.console) {
+    st.console = con; st.row = con;
+    return { write: { name: 'streamer', value: con }, store: null };
+  }
+  return { write: null, store: null };
+}
+// The frames of the row's animation, as read from the game, against what they are expected
+// to be: 'swap' when every one holds the game's own values or already the new ones and at
+// least one is still the game's, 'done' when all are the new ones, 'differs' otherwise
+// (another build, another sprite: nothing is to be written).
+export function rowFramesState(have, frames) {
+  const same = (a, b) => Array.isArray(a) && a.length === b.length && a.every((v, i) => v === b[i]);
+  let old = 0;
+  for (let i = 0; i < frames.length; i++) {
+    if (same(have[i], frames[i].was)) old++;
+    else if (!same(have[i], frames[i].now)) return 'differs';
+  }
+  return old ? 'swap' : 'done';
+}
+
+// ---- the files the page keeps for the game: two small readers -------------------
+//
+// What a file handed to IMPORT FILE is, by its first bytes and not by its name
+// (a phone's picker lets any file through, and may rename what it hands over):
+// the game's saved progress begins "ISAACNGSAVE0" (0x00b7ab6c "ISAACNGSAVE09R  "
+// and the older versions its loader still reads), a saved run "ISAACNG_GSR"
+// (0x00b7f218). Anything else is not a save, and is not written over one.
+const startsWith = (bytes, text) => {
+  if (!bytes) return false;
+  for (let i = 0; i < text.length; i++) if (bytes[i] !== text.charCodeAt(i)) return false;   // past a short file's end: undefined, no match
+  return true;
+};
+export function saveFileKind(bytes) {
+  if (startsWith(bytes, 'ISAACNGSAVE0')) return 'persistentgamedata';
+  if (startsWith(bytes, 'ISAACNG_GSR')) return 'gamestate';
+  return null;
+}
+
+// options.ini, one option: its value as the file has it (the last line that sets
+// it, as a reader that takes each line in turn ends up with), or null.
+const iniLine = (name) => new RegExp(`^[ \\t]*${name}[ \\t]*=[ \\t]*([^\\r\\n]*?)[ \\t]*$`, 'gm');
+export function getIniOption(text, name) {
+  let value = null;
+  for (const m of String(text || '').matchAll(iniLine(name))) value = m[1];
+  return value;
+}
+// ...and the file with that option set: every line that sets it is rewritten (a
+// file with the line twice must not keep an old value in the second), a file
+// without it gains the line right under [Options] (or at its end when it has no
+// such header), and the line endings the file uses are kept. The same string
+// comes back when nothing changes, so a caller can tell there is nothing to write.
+export function setIniOption(text, name, value) {
+  const src = String(text || ''), line = `${name}=${value}`;
+  if (iniLine(name).test(src)) {
+    const out = src.replace(iniLine(name), line);
+    return out === src ? src : out;
+  }
+  const nl = src.includes('\r\n') ? '\r\n' : '\n';
+  const head = /^﻿?[ \t]*\[Options\][^\r\n]*(?:\r\n|\n|$)/im.exec(src);
+  if (head) {
+    const at = head.index + head[0].length, before = src.slice(0, at);
+    return `${before}${/\n$/.test(before) ? '' : nl}${line}${nl}${src.slice(at)}`;
+  }
+  return `${src}${src && !/\n$/.test(src) ? nl : ''}${line}${nl}`;
 }

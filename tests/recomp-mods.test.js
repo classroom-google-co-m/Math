@@ -193,7 +193,8 @@ test('with the MOD BROWSER on the page the import row is left out, and the mods 
   // the boot asks the same question the page asks before it shows the MOD BROWSER paper
   const b = src('boot_web.mjs'), p = src('play.mjs');
   assert.ok(b.includes("const modBrowser = !!(params.get('catalogue') || window.isaacModCatalogue);"), 'the boot looks for a catalogue');
-  assert.ok(b.includes('await seedMods(modDb, seed, log, { sentinel: !modBrowser });'), 'and leaves the row out when there is one');
+  assert.ok(b.includes('await seedMods(modDb, seed, log, { sentinel: !modBrowser, scan: '), 'and leaves the row out when there is one');
+  assert.ok(b.includes("scan: params.get('modscan') === '0' ? null : createModScan() });"), 'round 122: the mods are read for the REPENTOGON layer unless the page is told not to');
   assert.ok(p.includes("const modsBrowsable = () => !!(params.get('catalogue') || (typeof window !== 'undefined' && window.isaacModCatalogue));"),
     'the paper is shown on the same condition');
 });
@@ -239,7 +240,8 @@ test('a mod too big to be seeded is refused at the import, not at the next boot'
   const m = src('mods.mjs');
   assert.ok(m.includes('if (mod.bytes > SEED_BUDGET) {'), 'checked where the person is looking');
   assert.ok(m.includes('the game is given ${mib(SEED_BUDGET)} for mods'), 'and said in those terms');
-  assert.ok(m.includes("if (mods.reduce((n, x) => n + x.bytes, 0) > SEED_BUDGET) notes.push("), 'a total that has gone past it is said too');
+  // round 107: of the mods that are seeded -- a packed one is read in place and takes none of it
+  assert.ok(m.includes("if (mods.filter((x) => !isPacked(x)).reduce((n, x) => n + x.bytes, 0) > SEED_BUDGET) notes.push("), 'a total that has gone past it is said too');
 });
 
 test('mods and saves are separate databases, and a write under mods/ never reaches the saves', () => {
@@ -294,9 +296,9 @@ test('round 81: the MOD BROWSER row needs a catalogue the build carries', () => 
   assert.match(portable, /def catalogue_script\(args\) -> str:/);
   assert.match(portable, /window\.isaacModCatalogue = %s;/, 'the build writes the base into the page');
   assert.match(portable, /p\.add_argument\("--catalogue"/);
-  // both shapes, because the single-file build has the same row
-  assert.equal((portable.match(/catalogue_script\(args\)/g) || []).length, 3,
-    'the definition and both call sites: the chunked page and the offline page');
+  // every shape, because the single-file builds have the same row
+  assert.equal((portable.match(/catalogue_script\(args\)/g) || []).length, 4,
+    'the definition and its three call sites: the chunked page, the offline page and the page of the .svg');
 });
 
 test('round 81: the driver presses the keys a player would to reach the browser', () => {
@@ -380,7 +382,8 @@ test('round 82: installing a mod turns mods on in the stored options', () => {
   const mods = readFileSync(join(root, 'scripts', 'recomp', 'web', 'mods.mjs'), 'utf8');
   const install = mods.slice(mods.indexOf('async function install('), mods.indexOf('async function install(') + 1400);
   assert.match(install, /if \(o\.onInstalled\) \{ try \{ await o\.onInstalled\(\); \}/);
-  assert.equal((mods.match(/o\.onInstalled/g) || []).length, 2, 'only the install path calls it');
+  // round 107: the zip install and the packed install (installPacked) are the two install paths
+  assert.equal((mods.match(/o\.onInstalled/g) || []).length, 4, 'only the install paths call it');
 });
 
 test('round 84: the page menu is what the game screen cannot do', () => {
